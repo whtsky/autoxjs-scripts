@@ -1357,7 +1357,7 @@ function isAdviseOutdated(advisePath) {
   if (!f.exists()) {
     return true;
   }
-  const u = 'https://api.github.com/repos/Zebartin/autoxjs-scripts/commits';
+  const u = 'https://api.github.com/repos/whtsky/autoxjs-scripts/commits';
   const params = {
     sha: 'dev',
     path: 'NIKKE/nikke.json',
@@ -1384,7 +1384,7 @@ function 下载咨询文本() {
   if (isAdviseOutdated(advisePath)) {
     try {
       log('正在下载最新咨询文本');
-      let respStr = http.get('https://github.blindfirefly.top/https://raw.githubusercontent.com/Zebartin/autoxjs-scripts/dev/NIKKE/nikke.json').body.string();
+      let respStr = http.get('https://github.blindfirefly.top/https://raw.githubusercontent.com/whtsky/autoxjs-scripts/dev/NIKKE/nikke.json').body.string();
       files.write(advisePath, respStr);
       advise = JSON.parse(respStr);
       log('下载完成');

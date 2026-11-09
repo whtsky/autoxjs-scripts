@@ -85,6 +85,14 @@ AutoX.js在初版Auto.js的基础上发展而来，是一个支持无障碍服�
 
 **如果开始运行后没有反应，或者只是打开了一下游戏，可能是没有给AutoX.js打开足够的权限。此时可以尝试打开悬浮窗，再运行脚本。**
 
+### 咨询答案自动更新
+
+咨询时会检查 `whtsky/autoxjs-scripts` 的 `dev` 分支，并在有更新时下载 [nikke.json](https://raw.githubusercontent.com/whtsky/autoxjs-scripts/dev/NIKKE/nikke.json)。下载仍使用脚本中配置的 GitHub 代理。
+
+仓库的[获取咨询文本工作流](../.github/workflows/NIKKE-scripts-advise.yml)每天 UTC 17:00（北京时间次日 01:00）运行，也支持在 Actions 页面手动触发；有变化时会将 `nikke.json` 提交到 `dev` 分支。
+
+GitHub 定时任务仅从默认分支触发，因此默认分支 `master` 也需要保留同一份工作流。fork 中需要启用 GitHub Actions；如需补充 Google 表格数据，请配置仓库 Secret `GOOGLE_API_KEY`，未配置时仅抓取 Gamekee 数据。
+
 ## 其他脚本的用途
 
 - 如果想单独运行模拟室任务，可以在设置里取消掉其他任务，或者单独运行`模拟室.js`即可，前提是运行`模拟室.js`时，手机画面位于模拟室首页位置（有“开始模拟”按钮）；
