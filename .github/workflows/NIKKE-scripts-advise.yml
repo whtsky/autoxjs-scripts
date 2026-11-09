@@ -1,9 +1,12 @@
 name: 获取咨询文本
 
-on: 
-  # schedule:
-  #   - cron:  '0 17 * * *'
+on:
+  schedule:
+    - cron: '0 17 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -29,6 +32,7 @@ jobs:
     - name: Commit nikke.json file if changed
       uses: stefanzweifel/git-auto-commit-action@v4
       with:
+        branch: dev
         commit_message: 更新nikke.json
         repository: ./NIKKE
         file_pattern: nikke.json
