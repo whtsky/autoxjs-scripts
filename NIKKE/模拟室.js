@@ -237,6 +237,60 @@ function oneSimulation(status) {
   }
   ocrUntilFound(res => res.text.includes('开始'), 30, 1000);
 }
+function setSimulationQuickReward(enabled, allowChange) {
+  const hint = ocrInfo.result.find(e =>
+    /可获得奖励时.{0,3}快速模拟将立即完成/.test(e.text) && e.bounds != null
+  );
+  if (!hint)
+    return false;
+  const h = hint.bounds.height();
+  const y = hint.bounds.centerY();
+  const left = ocrInfo.img.pixel(Math.round(hint.bounds.left - h * 3.4), y);
+  const right = ocrInfo.img.pixel(Math.round(hint.bounds.left - h * 1.6), y);
+  const isWhite = color =>
+    colors.red(color) > 220 && colors.green(color) > 220 && colors.blue(color) > 220;
+  if (isWhite(left) === isWhite(right))
+    throw new Error('无法识别快速模拟立即完成开关的状态');
+  if (isWhite(right) === enabled)
+    return false;
+  if (allowChange === false)
+    throw new Error('快速模拟立即完成开关未能保持设置');
+  clickRect({
+    text: '快速模拟立即完成开关',
+    bounds: new android.graphics.Rect(
+      hint.bounds.left - h * 4.2, y - h / 2,
+      hint.bounds.left - h, y + h / 2
+    )
+  }, 1, 0);
+  return true;
+}
+
+function finishQuickSimulation() {
+  const completed = ocrUntilFound((res, img) => {
+    const reward = res.find(e => /^(REWARDS?|获得奖励|奖励获得|获得道具)$/i.test(e.text));
+    if (!reward) {
+      if (res.text.includes('难度')) {
+        const selected = getSelectedDiffArea(res);
+        if (selected && selected.finished)
+          return true;
+      } else if (res.find(e => /^[^开]{0,3}开始模拟$/.test(e.text))) {
+        return true;
+      }
+    }
+    const confirm = res.find(e => /确认$/.test(e.text) && e.bounds != null &&
+      e.bounds.top > img.height / 2);
+    if (confirm) {
+      clickRect(confirm, 1, 0);
+    } else if (reward || /点击.*(继续|任意)|任意处/.test(res.text)) {
+      clickRect(getRandomArea(img, [0.2, 0.3, 0.8, 0.5]), 1, 0);
+    }
+    return null;
+  }, 30, 600);
+  if (!completed)
+    throw new Error('快速模拟奖励结算超时');
+  toastLog('快速模拟已立即完成并结算奖励');
+}
+
 function tryQuickSimulation(status) {
   const 模拟结束 = {
     text: "模拟结束",
@@ -248,24 +302,38 @@ function tryQuickSimulation(status) {
   };
   const 开始模拟 = {
     text: "开始模拟",
-    regex: /开始/,
+    regex: /^[^开]{0,3}开始模拟$/,
   };
   const 快速模拟 = {
     text: "快速模拟",
-    regex: /快[連德逮遠速]/,
+    regex: /^[^快]{0,3}快[連德逮遠速][模摸][拟擬以]$/,
+    filter: (bounds, img) =>
+      bounds && bounds.left > img.width / 2 && bounds.top > img.height / 2
   };
   let quick = false;
+  let toggleChanged = false;
+  let entered = false;
   for (let i = 0; i < 50; ++i) {
     sleep(300);
     screenshot();
+    if (quick && ocrInfo.result.find(e => /^(REWARDS?|获得奖励|奖励获得|获得道具)$/i.test(e.text))) {
+      finishQuickSimulation();
+      return true;
+    }
     if (appear(模拟结束)) {
+      entered = true;
       break;
     }
     if (appearThenClick(确认)) {
       sleep(3000);
       continue;
     }
-    if (appear(快速模拟)) {
+    if (!quick && appear(快速模拟)) {
+      if (setSimulationQuickReward(status.mode == '尽力而为', !toggleChanged)) {
+        toggleChanged = true;
+        sleep(600);
+        continue;
+      }
       const c = ocrInfo.img.pixel(快速模拟.bounds.right, 快速模拟.bounds.centerY())
       if (colors.red(c) > 200) {
         clickRect(快速模拟, 1, 0);
@@ -274,11 +342,13 @@ function tryQuickSimulation(status) {
         continue;
       }
     }
-    if (appearThenClick(开始模拟)) {
+    if (!quick && appearThenClick(开始模拟)) {
       sleep(3000);
       continue;
     }
   }
+  if (!entered)
+    throw new Error('无法进入快速模拟或识别立即完成结果');
   if (!quick) {
     return quick;
   }
@@ -517,7 +587,7 @@ function getSelectedDiffArea(ocrRes) {
   const finished = ocrRes.find(e =>
     e.bounds != null && e.bounds.top >= rewardText.bounds.bottom &&
     e.bounds.bottom <= startBtn.bounds.top &&
-    e.text.match(/[该地区已通关重置后可获得奖励]{3,}/) != null
+    e.text.match(/该地区已通关|重置模拟室后|重置后.{0,4}获得奖励/) != null
   );
   let diffs = ocrRes.toArray(3).toArray().filter(e =>
     e.text.match(/^[12345]$/) != null && e.bounds != null &&
@@ -531,18 +601,46 @@ function getSelectedDiffArea(ocrRes) {
       e.bounds.top < areaText.bounds.top
     );
     if (diffs.length != 5) {
-      console.error('没有找到表示难度的5个选项');
-      return null;
+      const diffMarkers = ocrRes.toArray(3).toArray().filter(e =>
+        /^(COMPLETE|SELECTED|LOCKED)$/i.test(e.text) && e.bounds != null &&
+        e.bounds.top > diffText.bounds.bottom && e.bounds.bottom < areaText.bounds.top
+      ).sort((a, b) => a.bounds.left - b.bounds.left);
+      if (diffMarkers.length != 5) {
+        console.error('没有找到表示难度的5个选项');
+        return null;
+      }
+      const diffGap = areaText.bounds.top - diffText.bounds.bottom;
+      diffs = diffMarkers.map((e, i) => ({
+        text: String(i + 1),
+        bounds: new android.graphics.Rect(
+          e.bounds.left, diffText.bounds.bottom + diffGap * 0.2,
+          e.bounds.right, diffText.bounds.bottom + diffGap * 0.65
+        )
+      }));
     }
   }
-  const areas = ocrRes.toArray(3).toArray().filter(e =>
+  let areas = ocrRes.toArray(3).toArray().filter(e =>
     e.text.match(/[\d\s+,\.]{4,10}/) != null && e.bounds != null &&
     e.bounds.bottom > areaText.bounds.bottom &&
     e.bounds.top < rewardText.bounds.top
   );
   if (areas.length != 3) {
-    console.error('没有找到表示地区的3个选项');
-    return null;
+    const areaMarkers = ocrRes.toArray(3).toArray().filter(e =>
+      /^(COMPLETE|SELECTED|LOCKED)$/i.test(e.text) && e.bounds != null &&
+      e.bounds.top > areaText.bounds.bottom && e.bounds.bottom < rewardText.bounds.top
+    ).sort((a, b) => a.bounds.left - b.bounds.left);
+    if (areaMarkers.length != 3) {
+      console.error('没有找到表示地区的3个选项');
+      return null;
+    }
+    const areaGap = rewardText.bounds.top - areaText.bounds.bottom;
+    areas = areaMarkers.map(e => ({
+      text: '',
+      bounds: new android.graphics.Rect(
+        e.bounds.left, areaText.bounds.bottom + areaGap * 0.2,
+        e.bounds.right, areaText.bounds.bottom + areaGap * 0.75
+      )
+    }));
   }
   diffs.sort((a, b) => {
     let t = a.bounds.top - b.bounds.top;
@@ -563,12 +661,12 @@ function getSelectedDiffArea(ocrRes) {
   }
   ret = { diffs: diffs, areas: areas, finished: finished != null };
   const diffSelectedText = ocrRes.find(e =>
-    e.text.match(/[SELCTD]{4,}/) != null && e.bounds != null &&
+    e.text.match(/^[SELCTD]{4,}$/i) != null && e.bounds != null &&
     e.bounds.bottom > diffText.bounds.bottom &&
     e.bounds.top < areaText.bounds.top
   );
   const areaSelectedText = ocrRes.find(e =>
-    e.text.match(/[SELCTD]{4,}/) != null && e.bounds != null &&
+    e.text.match(/^[SELCTD]{4,}$/i) != null && e.bounds != null &&
     e.bounds.bottom > areaText.bounds.bottom &&
     e.bounds.top < rewardText.bounds.top
   );
@@ -576,19 +674,12 @@ function getSelectedDiffArea(ocrRes) {
     console.error('没有找到SELECTED');
     return ret;
   }
-  // ES5 没有findLast
-  let diffSelected = null;
-  for (let i = 4; i >= 0; --i) {
-    let b = diffs[i].bounds;
-    if (b.left < diffSelectedText.bounds.right + diffSelectedText.bounds.width() / 2 &&
-      b.bottom < diffSelectedText.bounds.bottom) {
-      diffSelected = diffs[i];
-      break;
-    }
-  }
-  const areaSelected = areas.find(x =>
-    x.bounds.left > areaSelectedText.bounds.left
+  const nearest = (options, marker) => options.reduce((best, option) =>
+    Math.abs(option.bounds.centerX() - marker.bounds.centerX()) <
+    Math.abs(best.bounds.centerX() - marker.bounds.centerX()) ? option : best
   );
+  const diffSelected = nearest(diffs, diffSelectedText);
+  const areaSelected = nearest(areas, areaSelectedText);
   if (!diffSelected || !areaSelected) {
     console.error('没有找到选中的选项');
     return ret;

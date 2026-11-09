@@ -1,5 +1,7 @@
 import asyncio
+import csv
 import datetime
+import io
 import json
 import re
 import sys
@@ -58,7 +60,9 @@ async def get_from_gamekee_baidu_pan():
     }
     data = dict(pwd=pwd, surl=surl)
     resp = session.post(
-        'https://pan.baidu.com/api/docol/verify', params=params, data=data)
+        'https://pan.baidu.com/api/docol/verify', params=params, data=data,
+        timeout=30)
+    resp.raise_for_status()
     assert resp.json()['errno'] == 0
     # get signature
     params = {
@@ -69,7 +73,8 @@ async def get_from_gamekee_baidu_pan():
         'surl': surl
     }
     resp = session.get(
-        'https://pan.baidu.com/api/docol/signature', params=params)
+        'https://pan.baidu.com/api/docol/signature', params=params, timeout=30)
+    resp.raise_for_status()
     assert resp.json()['errno'] == 0
     sig = resp.json()['data']['sign']
     # fetch data via websocket
@@ -102,8 +107,10 @@ def get_from_gamekee_wiki(skip_names: set[str]):
     skip_names.update(['D:杀手妻子'])
     ret = dict()
     game_header = {'game-alias': 'nikke'}
-    entry_url = 'https://nikke.gamekee.com/v1/wiki/entry'
-    entry_json = session.get(entry_url, headers=game_header).json()
+    entry_url = 'https://www.gamekee.com/v1/wiki/entry'
+    entry_response = session.get(entry_url, headers=game_header, timeout=30)
+    entry_response.raise_for_status()
+    entry_json = entry_response.json()
     characters = None
     entry_id = None
     for d in entry_json['data']['entry_list']:
@@ -114,14 +121,16 @@ def get_from_gamekee_wiki(skip_names: set[str]):
                     entry_id = l['id']
                     break
             break
-    if characters == None:
-        print('获取gamekee角色图鉴失败')
-        return ret
-    entry_filter = session.get(
-        'https://nikke.gamekee.com/v1/entryFilter/getEntryFilter',
+    if characters is None:
+        raise ValueError('获取gamekee角色图鉴失败')
+    filter_response = session.get(
+        'https://www.gamekee.com/v1/entryFilter/getEntryFilter',
         headers=game_header,
-        params={'entry_id': entry_id}
-    ).json()
+        params={'entry_id': entry_id},
+        timeout=30
+    )
+    filter_response.raise_for_status()
+    entry_filter = filter_response.json()
     invalid_pair = set()
     for f in entry_filter['data']['entry_filter']:
         if f['name'] == '企业':
@@ -139,7 +148,7 @@ def get_from_gamekee_wiki(skip_names: set[str]):
                 print(nikke_entry)
                 print(entry_filter['data']['entry_filter_attr'].get(
                     str(nikke_entry['id'])))
-                raise Exception('gamekee wiki parsing failed')
+                raise ValueError('gamekee wiki parsing failed')
             if attr['value'][0] == '':
                 continue
             if (attr['input_id'], int(attr['value'][0])) in invalid_pair:
@@ -165,11 +174,16 @@ def get_from_gamekee_wiki(skip_names: set[str]):
         if not is_valid(nikke):
             ret[nikke["name"]] = []
             continue
-        data_json = session.get(
-            f"https://nikke.gamekee.com/v1/content/detail/{nikke['content_id']}",
+        detail_response = session.get(
+            f"https://www.gamekee.com/v1/content/detail/{nikke['content_id']}",
             headers=game_header,
-        ).json()
-        content_json = json.loads(data_json["data"]["content_json"])
+            timeout=30
+        )
+        detail_response.raise_for_status()
+        content = detail_response.json()["data"]["content_json"]
+        if not content:
+            raise ValueError(f"{nikke['name']}: Gamekee Wiki content format changed")
+        content_json = json.loads(content)
         base_data = content_json.get("baseData", [])
         name = next((x for x in base_data if x[0]["value"] == "角色名称"), None)
         name = name[1]["value"] if name else nikke["name"]
@@ -182,102 +196,105 @@ def get_from_gamekee_wiki(skip_names: set[str]):
     return ret
 
 
-def get_from_google_sheet(apiKey):
+def get_from_google_sheet(apiKey=None):
     ret = defaultdict(set)
     # 定义要访问的google表格的ID和范围
     spreadsheetId = '1K_oGZWL4uvuqYM9JL2l5Kb-L0IXIuyrDI347b6rurho'
-    # 构造请求的URL，附加API 密钥作为查询参数
-    url = f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheetId}/values:batchGet'
-
-    # 发送GET请求，获取第一列和第三列的内容
-    response = session.get(url, params={
-        'key': apiKey,
-        'ranges': ['角色排序查詢!A2:A', '角色排序查詢!C2:C']
-    })
-    result = response.json()
-    valueRanges = result.get('valueRanges', [])
-    # 整理结果
-    excluded_pattern = re.compile(r'[<＜]指挥官名[>＞]')
-    if not valueRanges:
-        print('No data found.')
+    if apiKey:
+        url = f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheetId}/values:batchGet'
+        response = session.get(url, params={
+            'key': apiKey,
+            'ranges': ['角色排序查詢!A2:A', '角色排序查詢!C2:C']
+        }, timeout=30)
+        response.raise_for_status()
+        value_ranges = response.json()['valueRanges']
+        names = next(x['values'] for x in value_ranges if 'A2' in x['range'])
+        answers = next(x['values'] for x in value_ranges if 'C2' in x['range'])
+        if len(names) != len(answers):
+            raise ValueError('Google sheet name and answer columns have different lengths')
+        rows = ((name[0] if name else '', '', answer[0] if answer else '')
+                for name, answer in zip(names, answers))
     else:
-        nikke_names = []
-        answers = []
-        for valueRange in valueRanges:
-            content = valueRange.get('values', [])
-            content = [zhconv.convert(row[0] if row else '', 'zh-sg')
-                       for row in content]
-            if 'A2' in valueRange.get('range'):
-                nikke_names = content
-            else:
-                answers = content
-        for n, a in zip(nikke_names, answers):
-            cleaned_a = punctuation_pattern.sub('', a)
-            cleaned_a = excluded_pattern.sub('', cleaned_a)
-            if len(cleaned_a) == 0:
-                continue
-            if n == 'Ｄ':
-                n = 'D'
-            elif n == '吉罗婷：寒冬杀手':
-                n = '吉萝婷：寒冬杀手'
-            ret[n.strip()].add(cleaned_a)
+        url = f'https://docs.google.com/spreadsheets/d/{spreadsheetId}/gviz/tq'
+        response = session.get(url, params={
+            'tqx': 'out:csv',
+            'sheet': '角色排序查詢',
+            'range': 'A2:C'
+        }, timeout=30)
+        response.raise_for_status()
+        if 'text/csv' not in response.headers.get('Content-Type', ''):
+            raise ValueError('Google sheet did not return CSV data')
+        rows = csv.reader(io.StringIO(response.text))
+    excluded_pattern = re.compile(r'[<＜]指挥官名[>＞]')
+    for row in rows:
+        if len(row) != 3:
+            raise ValueError('Google sheet row must contain three columns')
+        n = zhconv.convert(row[0], 'zh-sg').strip()
+        a = zhconv.convert(row[2], 'zh-sg')
+        cleaned_a = excluded_pattern.sub('', punctuation_pattern.sub('', a))
+        if not n or not cleaned_a:
+            continue
+        if n == 'Ｄ':
+            n = 'D'
+        elif n == '吉罗婷：寒冬杀手':
+            n = '吉萝婷：寒冬杀手'
+        ret[n].add(cleaned_a)
+    if not ret:
+        raise ValueError('Google sheet returned no consultation answers')
     return {k: list(v) for k, v in ret.items()}
 
 
-if __name__ == '__main__':
+def main(nikke_json_path=None):
+    if nikke_json_path is None:
+        nikke_json_path = Path(__file__).parent.parent / 'nikke.json'
+    api_key = sys.argv[1] if len(sys.argv) > 1 else None
+    google_data = get_from_google_sheet(api_key)
+    if not any(google_data.values()):
+        raise RuntimeError('No fresh consultation answers; cached data was not changed')
+    fresh_sources = [google_data]
     try:
-        zh_cn_data = asyncio.run(get_from_gamekee_baidu_pan())
-    except Exception as e:
-        print(e)
-        print('Cannot get data from baidu pan')
-        zh_cn_data = dict()
+        baidu_data = asyncio.run(asyncio.wait_for(get_from_gamekee_baidu_pan(), 60))
+        fresh_sources.append(baidu_data)
+    except (OSError, ValueError, KeyError, AssertionError, requests.RequestException,
+            websockets.WebSocketException) as error:
+        print(f'Gamekee Baidu source unavailable; cached answers retained: {error}')
+        baidu_data = {}
     try:
-        zh_cn_data_extra = get_from_gamekee_wiki(set(zh_cn_data.keys()))
-        zh_cn_data.update(zh_cn_data_extra)
-    except Exception as e:
-        # raise e
-        print(e)
-        print()
-    if len(sys.argv) > 1:
-        zh_tw_data = get_from_google_sheet(sys.argv[1])
-    else:
-        print('No google api provided')
-        zh_tw_data = dict()
-    # 在gamekee数据基础上，补充繁中服的数据
-    for k in zh_tw_data:
-        if len(zh_cn_data.get(k, [])) >= len(zh_tw_data[k]):
-            continue
-        print(f'补充：{k}')
-        zh_cn_data[k] = zh_tw_data[k]
-    for k in zh_cn_data:
-        zh_cn_data[k] = sorted(zh_cn_data[k])
-    for old_name, new_name in []:
-        if old_name not in zh_cn_data:
-            continue
-        if new_name in zh_cn_data:
-            continue
-        zh_cn_data[new_name] = zh_cn_data[old_name]
-
-    nikke_json_path = Path(__file__).parent.parent / 'nikke.json'
+        fresh_sources.append(get_from_gamekee_wiki(set(baidu_data.keys())))
+    except (requests.RequestException, ValueError, KeyError) as error:
+        print(f'Gamekee Wiki unavailable; using Google sheet and cached answers: {error}')
     with nikke_json_path.open('r', encoding='utf-8') as f:
         old_data = json.load(f)
+    updated_data = {name: set(answers) for name, answers in old_data.items()
+                    if name != '$meta'}
+    for source in fresh_sources:
+        for name, answers in source.items():
+            updated_data.setdefault(name, set()).update(answers)
     change_texts = []
-    for k in zh_cn_data.keys():
-        count = len(zh_cn_data[k]) - len(old_data.get(k, []))
+    for name in sorted(updated_data):
+        count = len(updated_data[name]) - len(set(old_data.get(name, [])))
         if count > 0:
-            change_texts.append(f'新增【{k}】{count}条')
-        elif count < 0:
-            change_texts.append(f'删除【{k}】{-count}条')
-    zh_cn_data['$meta'] = old_data.get('$meta', {'changelogs': []})
-    changelogs: list = zh_cn_data['$meta']['changelogs']
-    if change_texts:
-        print(f'Changes: {"，".join(change_texts)}')
-        today_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        changelogs.insert(0, f'{today_date}\t{"，".join(change_texts)}')
-    while len(changelogs) > 5:
-        changelogs.pop()
-    with nikke_json_path.open('w', encoding='utf-8') as f:
+            change_texts.append(f'新增【{name}】{count}条')
+    if not change_texts:
+        print('No new consultation answers; cached data was not changed')
+        return
+    print(f'Changes: {"，".join(change_texts)}')
+    today_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    metadata = dict(old_data.get('$meta', {}))
+    metadata['changelogs'] = [
+        f'{today_date}\t{"，".join(change_texts)}',
+        *metadata.get('changelogs', [])
+    ][:5]
+    output = {name: sorted(answers) for name, answers in updated_data.items()}
+    output['$meta'] = metadata
+    temp_path = nikke_json_path.with_suffix('.json.tmp')
+    with temp_path.open('w', encoding='utf-8') as f:
         json.dump(
-            dict(sorted(zh_cn_data.items())),
+            dict(sorted(output.items())),
             f, ensure_ascii=False, indent=2
         )
+    temp_path.replace(nikke_json_path)
+
+
+if __name__ == '__main__':
+    main()

@@ -1156,7 +1156,7 @@ function interceptBattle(battleBtn, checkDamage) {
   let damageNumber = null;
   let confirmCnt = 0;
   let skipped = false;
-  ocrUntilFound((res, img) => {
+  const completed = ocrUntilFound((res, img) => {
     const damage = res.find(e =>
       e.text.match(/DAMAGE/) != null && e.bounds != null &&
       e.bounds.right < img.width / 2 &&
@@ -1167,6 +1167,12 @@ function interceptBattle(battleBtn, checkDamage) {
       e.bounds.right < img.width / 2 &&
       e.bounds.bottom > img.height * 0.3
     );
+    const quickReward = res.find(e =>
+      /^(REWARDS?|获得奖励|奖励获得|获得道具)$/i.test(e.text) && e.bounds != null &&
+      e.bounds.top > img.height * 0.3
+    );
+    if (!checkDamage && quickReward && !res.text.match(/入战|挑战|剩余拦截次数/))
+      return true;
     if (damage != null && phase != null) {
       if (!checkDamage) {
         return true;
@@ -1232,7 +1238,9 @@ function interceptBattle(battleBtn, checkDamage) {
     // 跳过动画
     clickRect(getRandomArea(img, [0, 0, 1, 1]), 0.7, 0);
   }, 50, 1000);
-  ocrUntilFound((res, img) => {
+  if (!completed)
+    throw new Error('拦截战结果识别超时');
+  const returned = ocrUntilFound((res, img) => {
     const b = res.find(e =>
       e.text.match(/入战/) != null && e.bounds != null &&
       e.bounds.bottom > img.height / 2 &&
@@ -1251,6 +1259,8 @@ function interceptBattle(battleBtn, checkDamage) {
       return false;
     }
   }, 20, 1000);
+  if (!returned)
+    throw new Error('拦截战结算后未能返回战斗页面');
   return damageNumber;
 }
 
@@ -1261,7 +1271,16 @@ function 拦截战() {
     return;
   }
   let confirmCnt = 0;
+  let exhausted = false;
   const [battle, quickBattle, simBattle] = ocrUntilFound((res, img) => {
+    const noAttempts = res.find(e =>
+      /(?:^|[^\d])[0oO]\s*\/\s*3(?:$|[^\d])/.test(e.text) && e.bounds != null &&
+      e.bounds.top < img.height * 0.3
+    );
+    if (noAttempts && /[拦攔][截载]/.test(res.text)) {
+      exhausted = true;
+      return [null, null, null];
+    }
     let b = res.find(e =>
       e.text.match(/入战/) != null && e.bounds != null &&
       e.bounds.bottom > img.height / 2 &&
@@ -1323,6 +1342,11 @@ function 拦截战() {
       return null;
     }
   }, 30, 800) || [null, null, null];
+  if (exhausted) {
+    toastLog('今日拦截次数已用完');
+    返回首页();
+    return;
+  }
   if (battle === null) {
     console.error('无法进入拦截页面，放弃');
     返回首页();
@@ -1339,7 +1363,7 @@ function 拦截战() {
     let bColor = captureScreen().pixel(enterBattle.bounds.right + 3, enterBattle.bounds.centerY());
     let qbColor = captureScreen().pixel(quickBattle.bounds.right + 3, quickBattle.bounds.centerY());
     log(`进入战斗：${colors.toString(bColor)}，快速战斗：${colors.toString(qbColor)}`);
-    if (colors.red(qbColor) > 120 && i != 0) {
+    if (colors.red(qbColor) > 120) {
       interceptBattle(quickBattle, false);
     } else if (colors.red(bColor) > 150 || colors.blue(bColor) > 150) {
       let damage = interceptBattle(enterBattle, true);
