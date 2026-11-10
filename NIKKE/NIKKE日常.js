@@ -1010,21 +1010,8 @@ function 特殊竞技场() {
       e.bounds.left > atk.bounds.centerX()
     );
     if (ret == null) {
-      let touch = res.find(e =>
-        e.text.match(/^T.UCH/) != null && e.bounds != null &&
-        e.bounds.bottom < atk.bounds.top &&
-        e.bounds.left > atk.bounds.centerX()
-      );
-      ret = res.find(e =>
-        e.text.startsWith('特殊') && e.bounds != null &&
-        e.bounds.bottom < atk.bounds.top &&
-        e.bounds.left > atk.bounds.centerX()
-      );
-      if (!ret || !touch)
-        return null;
-      // 下移识别框
-      ret.bounds.top = touch.bounds.top;
-      ret.bounds.bottom = touch.bounds.bottom;
+      log('无法识别特殊竞技场奖励进度百分比，不使用估算坐标');
+      return null;
     }
     return ret;
   }, 10, 1000);
@@ -1032,12 +1019,16 @@ function 特殊竞技场() {
     log('特殊竞技场赛季结束');
     return;
   }
+  if (specialRewardBtn == null) {
+    toastLog('未能识别特殊竞技场奖励进度，跳过领取');
+    return;
+  }
   if (specialRewardBtn != null) {
     if (specialRewardBtn.text == '0%') {
       log('奖励进度0%，跳过');
       return;
     }
-    ocrUntilFound(res => {
+    let rewardDetailsOpened = ocrUntilFound(res => {
       const teamUpPage = res.find(e => e.text.match(/[攻击防御自动下一步]{2,}/) != null);
       if (teamUpPage != null) {
         log('误入编队界面，返回');
@@ -1045,35 +1036,46 @@ function 特殊竞技场() {
         sleep(600);
         return null;
       }
-      if (res.text.includes('取'))
+      if (res.text.includes('竞技场资讯') || res.text.includes('取'))
         return true;
-      clickRect(specialRewardBtn, 0.8, 100);
+      clickRect(specialRewardBtn, 0.1, 100);
       return null;
     }, 15, 500);
-    log('领取竞技场奖励');
-    ocrUntilFound((res, img) => {
-      if (!res.text.includes('取'))
-        return null;
-      let confirm = res.find(e =>
+    if (!rewardDetailsOpened) {
+      toastLog('未能打开特殊竞技场奖励面板，跳过领取');
+      return;
+    }
+    let claimClicked = false;
+    const rewardClaimed = ocrUntilFound((res, img) => {
+      const claimButton = res.find(e =>
         e.text.match(/[领領邻]取.{0,3}$/) != null && e.bounds != null &&
         e.bounds.top > img.height * 0.6 &&
         e.bounds.right > img.width * 0.5
       );
-      if (confirm != null) {
-        clickRect(confirm, 1, 0);
-        sleep(1000);
+      if (claimButton != null) {
+        clickRect(claimButton, 0.1, 0);
+        claimClicked = true;
         return null;
       }
-      let clickReward = res.find(e =>
-        e.text.includes('点击') && e.bounds != null &&
+      const clickReward = res.find(e =>
+        e.text.match(/点击.{0,4}领取奖励/) != null && e.bounds != null &&
         e.bounds.bottom > img.height * 0.4
       );
       if (clickReward != null) {
-        clickRect(clickReward, 1, 0);
-        return true;
+        clickRect(clickReward, 0.1, 0);
+        claimClicked = true;
+        return null;
       }
+      const arenaPage = res.find(e => e.text.match(/SPECIAL|ARENA/) != null) &&
+        res.find(e => e.text.match(/ATK|DEF/) != null);
+      if (claimClicked && arenaPage && !res.text.match(/领取|点击|竞技场资讯/))
+        return true;
       return null;
-    }, 20, 600);
+    }, 30, 600);
+    if (!rewardClaimed)
+      toastLog('未能确认特殊竞技场奖励已领取');
+    else
+      toastLog('特殊竞技场奖励领取完成');
   }
 }
 
@@ -1171,6 +1173,11 @@ function interceptBattle(battleBtn, checkDamage) {
       /^(REWARDS?|获得奖励|奖励获得|获得道具)$/i.test(e.text) && e.bounds != null &&
       e.bounds.top > img.height * 0.3
     );
+    const nextStep = res.find(e =>
+      e.text.match(/点击任意处进行下一步/) != null && e.bounds != null
+    );
+    if (nextStep)
+      return true;
     if (!checkDamage && quickReward && !res.text.match(/入战|挑战|剩余拦截次数/))
       return true;
     if (damage != null && phase != null) {
@@ -1241,6 +1248,13 @@ function interceptBattle(battleBtn, checkDamage) {
   if (!completed)
     throw new Error('拦截战结果识别超时');
   const returned = ocrUntilFound((res, img) => {
+    const nextStep = res.find(e =>
+      e.text.match(/点击任意处进行下一步/) != null && e.bounds != null
+    );
+    if (nextStep) {
+      clickRect(nextStep, 0.8, 0);
+      return false;
+    }
     const b = res.find(e =>
       e.text.match(/入战/) != null && e.bounds != null &&
       e.bounds.bottom > img.height / 2 &&
@@ -1494,6 +1508,64 @@ function 咨询() {
   返回首页();
 }
 
+function matchAdviseNikkeName(target) {
+  const normalize = name => name.toLowerCase().replace(/[\s:：]/g, '');
+  const names = Object.keys(advise);
+  const normalizedTarget = normalize(target);
+  const exact = names.filter(name => normalize(name) == normalizedTarget);
+  if (exact.length == 1)
+  return { result: exact[0], similarity: 1 };
+  if (exact.length > 1)
+  return { result: null, nearest: exact[0], similarity: 1, reason: '名称归一化后有多个匹配' };
+
+  let baseName = null;
+  const separator = target.search(/[:：]/);
+  if (separator >= 0)
+  baseName = normalize(target.slice(0, separator));
+  else {
+  const prefixes = names.map(name => normalize(name.split(/[:：]/)[0]))
+    .filter(base => normalizedTarget.startsWith(base) && normalizedTarget.length > base.length);
+  if (prefixes.length > 0)
+    baseName = prefixes.reduce((a, b) => a.length > b.length ? a : b);
+  }
+  if (baseName != null) {
+  const sameBase = names.filter(name => normalize(name.split(/[:：]/)[0]) == baseName);
+  if (sameBase.length > 0) {
+    const closestVariant = sameBase.map(name => ({
+      result: name,
+      similarity: mostSimilar(normalizedTarget, [normalize(name)]).similarity
+    })).sort((a, b) => b.similarity - a.similarity)[0];
+    if (closestVariant.similarity >= 0.8)
+      return closestVariant;
+    return {
+      result: null,
+      nearest: closestVariant.result,
+      similarity: closestVariant.similarity,
+      reason: '该妮姬形态没有对应的咨询数据'
+    };
+  }
+  }
+
+  const ranked = names.map(name => ({
+  result: name,
+  similarity: mostSimilar(normalizedTarget, [normalize(name)]).similarity
+  })).sort((a, b) => b.similarity - a.similarity);
+  const best = ranked[0];
+  const second = ranked[1];
+  if (!best || best.similarity < 0.5 ||
+  (second && best.similarity - second.similarity < 0.15)) {
+  return {
+    result: null,
+    nearest: best ? best.result : null,
+    similarity: best ? best.similarity : 0,
+    reason: best && second && best.similarity - second.similarity < 0.15
+      ? '多个妮姬名称匹配度接近'
+      : 'JSON中没有可靠的名称匹配'
+  };
+  }
+  return best;
+}
+
 function 咨询页面识别(btnText, maxRetry) {
   下载咨询文本();
   btnText = btnText || '^[^快連德逮速遠]*咨询$';
@@ -1528,6 +1600,7 @@ function 咨询页面识别(btnText, maxRetry) {
   }
   let results = [];
   let name = '';
+  let bestUnmatched = null;
   let hasMax = false;
   let img = images.clip(
     captureScreen(), nameRect.left, nameRect.top,
@@ -1558,13 +1631,17 @@ function 咨询页面识别(btnText, maxRetry) {
       }
       if (childText.match(/^雷[费骨賽費登]$/) != null)
         childText = '基里';
-      compared = mostSimilar(
-        childText.replace(/[i,\s]+$/, ''),
-        Object.keys(advise)
-      );
-      if (compared.similarity >= 0.5) {
-        if (compared.similarity == 0.5 && ['2B', 'A2', 'N102'].includes(compared.result))
-          continue;
+      compared = matchAdviseNikkeName(childText.replace(/[i,\s]+$/, ''));
+      if (!bestUnmatched || compared.similarity > bestUnmatched.similarity) {
+        bestUnmatched = {
+          result: compared.result,
+          nearest: compared.nearest,
+          similarity: compared.similarity,
+          reason: compared.reason,
+          text: childText
+        };
+      }
+      if (compared.result != null) {
         results.push(compared);
       }
     }
@@ -1572,13 +1649,16 @@ function 咨询页面识别(btnText, maxRetry) {
       name = results.reduce((a, b) => a.similarity > b.similarity ? a : b).result;
       break;
     }
-    if (compared.similarity)
-      log(`妮姬名OCR结果：${res.join(' ')}，匹配：${compared.result}，相似度${compared.similarity.toFixed(2)}`);
     if (scale < maxRetry)
       log(`妮姬名字识别相似度过低，重试(${scale}/${maxRetry})`);
     else {
-      log(`已达最大尝试次数。可能原因：\n1.不支持反常\n2.不支持新版本妮姬`);
-      toast('妮姬名字识别失败');
+      const nearest = bestUnmatched && bestUnmatched.nearest;
+      const similarity = bestUnmatched ? bestUnmatched.similarity.toFixed(2) : '0.00';
+      const reason = bestUnmatched ? bestUnmatched.reason : 'OCR未检测到名称';
+      log(`妮姬名称未匹配咨询JSON：OCR="${res.join(' ')}"，最近候选="${nearest || '无'}"，相似度${similarity}，原因：${reason}`);
+      toast(bestUnmatched && bestUnmatched.reason == '该妮姬形态没有对应的咨询数据'
+        ? '该妮姬形态暂无咨询答案'
+        : '未找到可靠的妮姬名称匹配');
     }
   }
   img && img.recycle();

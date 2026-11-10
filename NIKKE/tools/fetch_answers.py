@@ -8,6 +8,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 import websockets
@@ -102,6 +103,24 @@ def get_from_gamekee_netcut():
     return parse_gamekee_data(note_content)
 
 
+def get_gamekee_content(content_detail, game_header):
+    content = content_detail.get('content_json')
+    if content:
+        content_json = json.loads(content)
+    else:
+        content_cdn = content_detail.get('content_cdn')
+        if not content_cdn:
+            raise ValueError('Gamekee content has neither inline JSON nor a CDN URL')
+        content_url = urljoin('https://www.gamekee.com', content_cdn)
+        response = session.get(content_url, headers=game_header, timeout=30)
+        response.raise_for_status()
+        content_json = response.json()
+
+    if not isinstance(content_json, dict) or not isinstance(content_json.get('baseData'), list):
+        raise ValueError('Gamekee content JSON does not contain baseData')
+    return content_json
+
+
 def get_from_gamekee_wiki(skip_names: set[str]):
     # gamekee误写
     skip_names.update(['D:杀手妻子'])
@@ -157,38 +176,74 @@ def get_from_gamekee_wiki(skip_names: set[str]):
 
     def get_single(base_data):
         for d in base_data:
-            if d[0]['value'] != '120好感度':
+            if (
+                not isinstance(d, list) or len(d) < 2 or
+                not isinstance(d[0], dict) or not isinstance(d[1], dict) or
+                d[0].get('value') != '120好感度'
+            ):
                 continue
-            answer = d[1]['value']
+            answer = d[1].get('value')
+            if not isinstance(answer, str):
+                continue
             answer = punctuation_pattern.sub('', answer)
             answer = answer.replace('AccountDataNickName', '')
             if answer:
                 yield answer
 
+    content_cdn_blocked = False
+    parsed_entries = 0
+    skipped_entries = 0
     for nikke in characters:
-        if nikke["name"] in skip_names:
+        nikke_name = nikke.get('name', '<unknown>')
+        if nikke_name in skip_names:
             continue
         # 编辑中词条
-        if nikke["content_id"] == 0:
+        content_id = nikke.get('content_id')
+        if not content_id:
             continue
-        if not is_valid(nikke):
-            ret[nikke["name"]] = []
+        try:
+            if not is_valid(nikke):
+                ret[nikke_name] = []
+                continue
+            detail_response = session.get(
+                f"https://www.gamekee.com/v1/content/detail/{content_id}",
+                headers=game_header,
+                timeout=30
+            )
+            detail_response.raise_for_status()
+            detail = detail_response.json()['data']
+            if not isinstance(detail, dict):
+                raise ValueError('Gamekee content detail is not an object')
+            if content_cdn_blocked and not detail.get('content_json'):
+                skipped_entries += 1
+                continue
+
+            content_json = get_gamekee_content(detail, game_header)
+            base_data = content_json['baseData']
+            name_entry = next((
+                row for row in base_data
+                if isinstance(row, list) and row and
+                isinstance(row[0], dict) and row[0].get('value') == '角色名称'
+            ), None)
+            name = name_entry[1].get('value') if (
+                name_entry and len(name_entry) > 1 and isinstance(name_entry[1], dict)
+            ) else nikke_name
+            if not isinstance(name, str) or not name:
+                name = nikke_name
+            ret[name] = set(get_single(base_data))
+            parsed_entries += 1
+        except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as error:
+            skipped_entries += 1
+            response = getattr(error, 'response', None)
+            if response is not None and response.status_code == 567:
+                content_cdn_blocked = True
+                print('Gamekee content CDN returned HTTP 567; skipping remaining CDN-backed entries')
+            print(f'Gamekee Wiki entry skipped ({nikke_name}): {error}')
             continue
-        detail_response = session.get(
-            f"https://www.gamekee.com/v1/content/detail/{nikke['content_id']}",
-            headers=game_header,
-            timeout=30
-        )
-        detail_response.raise_for_status()
-        content = detail_response.json()["data"]["content_json"]
-        if not content:
-            raise ValueError(f"{nikke['name']}: Gamekee Wiki content format changed")
-        content_json = json.loads(content)
-        base_data = content_json.get("baseData", [])
-        name = next((x for x in base_data if x[0]["value"] == "角色名称"), None)
-        name = name[1]["value"] if name else nikke["name"]
-        ret[name] = set(get_single(base_data))
         time.sleep(0.5)
+    if parsed_entries == 0:
+        raise ValueError('Gamekee Wiki did not yield any readable character entries')
+    print(f'Gamekee Wiki: parsed {parsed_entries} entries, skipped {skipped_entries}')
     print('Gamekee Wiki:')
     keys = list(ret.keys())
     for i in range(0, len(keys), 5):
