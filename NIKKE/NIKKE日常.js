@@ -975,108 +975,198 @@ function 新人竞技场(rookieTarget) {
 }
 
 function 特殊竞技场() {
+  const trace = [];
+  const traceLog = message => {
+    const line = `[特殊竞技场] ${message}`;
+    trace.push(line);
+    log(line);
+  };
+  const saveFailure = message => {
+    traceLog(`失败：${message}`);
+    saveError(new Error(`${message}\n${trace.join('\n')}`));
+    toastLog(message);
+  };
+  const describeBounds = bounds =>
+    bounds ? `(${bounds.left},${bounds.top})-(${bounds.right},${bounds.bottom})` : '无';
+  const clickCenter = (target, delay) => {
+    if (delay > 0)
+      sleep(delay);
+    const x = Math.round(target.bounds.centerX());
+    const y = Math.round(target.bounds.centerY());
+    traceLog(`点击中心：${target.text || '无文字'}@${describeBounds(target.bounds)}，坐标=(${x},${y})`);
+    click(x, y);
+  };
+  const summarizeOcr = (res, img) => {
+    const relevant = res.toArray(3).toArray().filter(e =>
+      e.bounds != null &&
+      e.text.match(/SPECIAL|ARENA|ATK|DEF|%|TOUCH|奖励|领取|点击|竞技场资讯|战斗|返回/i) != null
+    );
+    return `截图=${img.width}x${img.height}；OCR=${relevant.map(e =>
+      `"${e.text}"@${describeBounds(e.bounds)}`
+    ).join(' | ') || '未识别到相关文字'}`;
+  };
+  const findClaimButton = (res, img) => res.find(e =>
+    e.text.match(/[领領邻]取.{0,3}$/) != null && e.bounds != null &&
+    e.bounds.top > img.height * 0.6 &&
+    e.bounds.right > img.width * 0.5
+  );
+
   if (NIKKEstorage.get('specialArenaClaim', true) != true) {
-    log('已设置不领取特殊竞技场奖励');
+    traceLog('已设置不领取特殊竞技场奖励');
     return;
   }
-  clickRect(ocrUntilFound(res => res.find(e => e.text.includes('SPECIAL')), 30, 1000));
+
+  const specialTab = ocrUntilFound(res => res.find(e =>
+    e.text.includes('SPECIAL') && e.bounds != null
+  ), 30, 1000);
+  if (specialTab == null) {
+    saveFailure('无法识别SPECIAL竞技场入口');
+    return;
+  }
+  traceLog(`点击SPECIAL入口 "${specialTab.text}"@${describeBounds(specialTab.bounds)}`);
+  clickCenter(specialTab, 1000);
   toastLog('进入特殊竞技场');
-  // 如果识别出了百分号，直接点百分号
-  // 没有就点上方中央“特殊竞技场”下方位置，可能能点到
-  let specialRewardBtn = ocrUntilFound(res => {
+
+  let progressPolls = 0;
+  let specialPageClicks = 0;
+  let lastOcr = '';
+  let specialRewardBtn = ocrUntilFound((res, img) => {
+    progressPolls++;
+    lastOcr = summarizeOcr(res, img);
     const seasonOver = res.find(e => e.text.match(/(敬请|期待)/) != null);
     if (seasonOver) {
+      traceLog(`特殊竞技场赛季结束；${lastOcr}`);
       return 'seasonOver';
     }
     let atk = res.find(e => e.text.match(/(ATK|DEF)/) != null);
     if (!atk) {
       let enterSpecial = res.find(e => e.text.includes('SPECIAL'));
-      if (enterSpecial != null) {
-        clickRect(enterSpecial, 1, 0);
+      if (enterSpecial != null && specialPageClicks < 2) {
+        specialPageClicks++;
+        traceLog(`未进入特殊竞技场详情，重试点击SPECIAL入口 (${specialPageClicks}/2)；${lastOcr}`);
+        clickCenter(enterSpecial, 0);
         return null;
       }
       const teamUpPage = res.find(e => e.text.match(/[攻击防御自动下一步]{2,}/) != null);
       if (teamUpPage != null) {
-        log('误入编队界面，返回');
+        traceLog(`误入编队界面，返回；${lastOcr}`);
         back();
         sleep(600);
         return null;
       }
+      if (progressPolls == 1 || progressPolls % 5 == 0)
+        traceLog(`等待特殊竞技场详情 (${progressPolls}/10)；${lastOcr}`);
       return null;
     }
-    let ret = res.find(e =>
+    const percentages = res.toArray(3).toArray().filter(e =>
       e.text.includes('%') && e.bounds != null &&
       e.bounds.bottom < atk.bounds.top &&
       e.bounds.left > atk.bounds.centerX()
     );
-    if (ret == null) {
-      log('无法识别特殊竞技场奖励进度百分比，不使用估算坐标');
+    if (percentages.length == 0) {
+      if (progressPolls == 1 || progressPolls % 5 == 0)
+        traceLog(`未识别到奖励进度百分比 (${progressPolls}/10)；ATK=${describeBounds(atk.bounds)}；${lastOcr}`);
       return null;
     }
-    return ret;
+    traceLog(`识别到奖励进度候选：${percentages.map(e =>
+      `"${e.text}"@${describeBounds(e.bounds)}`
+    ).join(' | ')}；${lastOcr}`);
+    if (percentages.length > 1) {
+      traceLog('检测到多个奖励百分比，拒绝猜测点击目标');
+      return null;
+    }
+    return percentages[0];
   }, 10, 1000);
   if (specialRewardBtn == 'seasonOver') {
-    log('特殊竞技场赛季结束');
     return;
   }
   if (specialRewardBtn == null) {
-    toastLog('未能识别特殊竞技场奖励进度，跳过领取');
+    saveFailure(`未能识别特殊竞技场奖励进度；${lastOcr || '没有有效OCR结果'}`);
     return;
   }
-  if (specialRewardBtn != null) {
-    if (specialRewardBtn.text == '0%') {
-      log('奖励进度0%，跳过');
-      return;
-    }
-    let rewardDetailsOpened = ocrUntilFound(res => {
-      const teamUpPage = res.find(e => e.text.match(/[攻击防御自动下一步]{2,}/) != null);
-      if (teamUpPage != null) {
-        log('误入编队界面，返回');
-        back();
-        sleep(600);
-        return null;
-      }
-      if (res.text.includes('竞技场资讯') || res.text.includes('取'))
-        return true;
-      clickRect(specialRewardBtn, 0.1, 100);
-      return null;
-    }, 15, 500);
-    if (!rewardDetailsOpened) {
-      toastLog('未能打开特殊竞技场奖励面板，跳过领取');
-      return;
-    }
-    let claimClicked = false;
-    const rewardClaimed = ocrUntilFound((res, img) => {
-      const claimButton = res.find(e =>
-        e.text.match(/[领領邻]取.{0,3}$/) != null && e.bounds != null &&
-        e.bounds.top > img.height * 0.6 &&
-        e.bounds.right > img.width * 0.5
-      );
-      if (claimButton != null) {
-        clickRect(claimButton, 0.1, 0);
-        claimClicked = true;
-        return null;
-      }
-      const clickReward = res.find(e =>
-        e.text.match(/点击.{0,4}领取奖励/) != null && e.bounds != null &&
-        e.bounds.bottom > img.height * 0.4
-      );
-      if (clickReward != null) {
-        clickRect(clickReward, 0.1, 0);
-        claimClicked = true;
-        return null;
-      }
-      const arenaPage = res.find(e => e.text.match(/SPECIAL|ARENA/) != null) &&
-        res.find(e => e.text.match(/ATK|DEF/) != null);
-      if (claimClicked && arenaPage && !res.text.match(/领取|点击|竞技场资讯/))
-        return true;
-      return null;
-    }, 30, 600);
-    if (!rewardClaimed)
-      toastLog('未能确认特殊竞技场奖励已领取');
-    else
-      toastLog('特殊竞技场奖励领取完成');
+  if (/^0\s*%$/.test(specialRewardBtn.text)) {
+    traceLog(`奖励进度为0%，跳过；目标="${specialRewardBtn.text}"@${describeBounds(specialRewardBtn.bounds)}`);
+    return;
   }
+
+  traceLog(`奖励进度目标="${specialRewardBtn.text}"@${describeBounds(specialRewardBtn.bounds)}；使用中心点点击`);
+  let progressClicked = false;
+  let detailPolls = 0;
+  let rewardDetailsOpened = ocrUntilFound((res, img) => {
+    detailPolls++;
+    lastOcr = summarizeOcr(res, img);
+    const dialogTitle = res.find(e =>
+      e.text.match(/竞技场资讯|SPECIAL ARENA REWARDS/i) != null
+    );
+    const claimButton = findClaimButton(res, img);
+    if (dialogTitle != null || claimButton != null) {
+      traceLog(`奖励面板已打开；标题=${dialogTitle ? dialogTitle.text : '无'}；领取按钮=${claimButton ? `${claimButton.text}@${describeBounds(claimButton.bounds)}` : '无'}；${lastOcr}`);
+      return true;
+    }
+    const teamUpPage = res.find(e => e.text.match(/[攻击防御自动下一步]{2,}/) != null);
+    if (teamUpPage != null) {
+      traceLog(`误入编队界面，返回；${lastOcr}`);
+      back();
+      sleep(600);
+      return null;
+    }
+    if (!progressClicked) {
+      traceLog(`点击奖励进度圈中心，等待面板；${lastOcr}`);
+      clickCenter(specialRewardBtn, 100);
+      progressClicked = true;
+    } else if (detailPolls == 1 || detailPolls % 5 == 0) {
+      traceLog(`等待奖励面板 (${detailPolls}/15)；${lastOcr}`);
+    }
+    return null;
+  }, 15, 500);
+  if (!rewardDetailsOpened) {
+    saveFailure(`点击奖励进度后未识别到奖励面板；${lastOcr || '没有有效OCR结果'}`);
+    return;
+  }
+
+  let claimButtonClicked = false;
+  let collectPromptClicked = false;
+  let claimPolls = 0;
+  const rewardClaimed = ocrUntilFound((res, img) => {
+    claimPolls++;
+    lastOcr = summarizeOcr(res, img);
+    const clickReward = res.find(e =>
+      e.text.match(/点击.{0,4}领取奖励/) != null && e.bounds != null &&
+      e.bounds.bottom > img.height * 0.4
+    );
+    if (clickReward != null) {
+      traceLog(`领取动画提示="${clickReward.text}"@${describeBounds(clickReward.bounds)}`);
+      if (!collectPromptClicked) {
+        clickCenter(clickReward, 0);
+        collectPromptClicked = true;
+      }
+      return null;
+    }
+    const claimButton = findClaimButton(res, img);
+    if (claimButton != null) {
+      traceLog(`奖励弹窗按钮="${claimButton.text}"@${describeBounds(claimButton.bounds)}`);
+      if (!claimButtonClicked) {
+        clickCenter(claimButton, 0);
+        claimButtonClicked = true;
+      }
+      return null;
+    }
+    const arenaPage = res.find(e => e.text.match(/SPECIAL|ARENA/) != null) &&
+      res.find(e => e.text.match(/ATK|DEF/) != null);
+    if (collectPromptClicked && arenaPage && !res.text.match(/领取|点击|竞技场资讯/)) {
+      traceLog(`确认已返回竞技场页面；${lastOcr}`);
+      return true;
+    }
+    if (claimPolls == 1 || claimPolls % 5 == 0)
+      traceLog(`等待领取结果 (${claimPolls}/30)；弹窗点击=${claimButtonClicked}，收取提示点击=${collectPromptClicked}；${lastOcr}`);
+    return null;
+  }, 30, 600);
+  if (!rewardClaimed) {
+    saveFailure(`领取过程未确认返回竞技场；弹窗点击=${claimButtonClicked}，收取提示点击=${collectPromptClicked}；${lastOcr || '没有有效OCR结果'}`);
+    return;
+  }
+  traceLog('特殊竞技场奖励领取完成');
+  toastLog('特殊竞技场奖励领取完成');
 }
 
 function 竞技场() {
