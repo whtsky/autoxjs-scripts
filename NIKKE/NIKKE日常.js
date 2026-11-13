@@ -2,7 +2,7 @@ var {
   启动NIKKE, 等待NIKKE加载, 退出NIKKE,
   mostSimilar, 返回首页, 关闭限时礼包,
   detectNikkes, NikkeToday, checkAuto,
-  reportEvent, saveError
+  reportEvent, saveError, saveDiagnostic
 } = require('./NIKKEutils.js');
 var { 模拟室 } = require('./模拟室.js');
 var {
@@ -18,21 +18,32 @@ if (typeof module === 'undefined') {
   checkConfig();
   killSameScripts();
   reportEvent();
-  启动NIKKE();
-  // 保证申请截屏权限时，屏幕是游戏画面
-  let i;
-  for (i = 0; i < 10; ++i) {
-    let orientation = context.getResources().getConfiguration().orientation;
-    if (orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT) {
-      requestScreenCaptureAuto(img => img.width < img.height);
-      日常();
-      exit();
+  try {
+    启动NIKKE();
+    // 保证申请截屏权限时，屏幕是游戏画面
+    let i;
+    for (i = 0; i < 10; ++i) {
+      let orientation = context.getResources().getConfiguration().orientation;
+      if (orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT) {
+        requestScreenCaptureAuto(img => img.width < img.height);
+        日常();
+        exit();
+      }
+      toast('脚本等待中...');
+      sleep(3000);
     }
-    toast('脚本等待中...');
-    sleep(3000);
-  }
-  if (i == 10) {
-    toastLog('游戏不是竖屏状态，脚本退出');
+    if (i == 10) {
+      toastLog('游戏不是竖屏状态，脚本退出');
+    }
+  } catch (error) {
+    const msg = String((error && error.message) || error || '');
+    if (!msg.includes('InterruptedException') && !msg.includes('ScriptInterruptedException')) {
+      console.error(msg);
+      if (error && error.stack)
+        console.error(error.stack);
+      saveError(error, { task: '启动流程', stage: 'top-level' });
+    }
+    throw error;
   }
 }
 else {
@@ -54,52 +65,120 @@ function 日常() {
     模拟室: () => 模拟室(true),
     每日任务: 每日任务
   };
-  let alreadyRetry = 0;
   const maxRetry = NIKKEstorage.get('maxRetry', 1);
-  if (NIKKEstorage.get('launchMethod', 'NIKKE') == 'Manually') {
-    alreadyRetry = maxRetry;
-  }
-  let retryFunc = (taskName) => {
-    for (; alreadyRetry <= maxRetry; ++alreadyRetry) {
+  const isManual = NIKKEstorage.get('launchMethod', 'NIKKE') == 'Manually';
+  const effectiveMaxRetry = isManual ? 0 : maxRetry;
+  const completedTasks = [];
+  const failedTasks = [];
+  let interrupted = false;
+
+  const isInterruptedError = error => {
+    const msg = String((error && error.message) || error || '');
+    return msg.includes('InterruptedException') || msg.includes('ScriptInterruptedException');
+  };
+
+  const recoverToLobby = failedTaskName => {
+    log(`[容错恢复] 任务"${failedTaskName}"异常，尝试恢复回游戏大厅以继续后续任务`);
+    try {
+      返回首页(true);
+      return true;
+    } catch (e1) {
+      if (isInterruptedError(e1)) {
+        interrupted = true;
+        return false;
+      }
+      console.warn(`[容错恢复] 直接返回首页失败(${e1.message})，尝试连续返回后恢复`);
+      for (let k = 0; k < 5; ++k) {
+        back();
+        sleep(800);
+      }
       try {
         等待NIKKE加载();
-        taskFunc[taskName]();
         return true;
-      } catch (error) {
-        if (!error.message.includes('InterruptedException')) {
-          toast(error.message);
-          console.error(error.message);
-          console.error(error.stack);
-          if (!error.message.includes('加载')) {
-            // reportEvent('error', {
-            //   task: taskName,
-            //   tagName: NIKKEstorage.get('tagName', '无记录'),
-            // });
-            // 保存出错内容
-            saveError(error);
-          }
-          if (alreadyRetry != maxRetry) {
-            toastLog(`脚本出错，即将重试(${alreadyRetry + 1}/${maxRetry})`);
-            sleep(3000);
+      } catch (e2) {
+        if (isInterruptedError(e2)) {
+          interrupted = true;
+          return false;
+        }
+        console.error(`[容错恢复] 后退恢复失败：${e2.message}`);
+        if (!isManual) {
+          try {
+            log('[容错恢复] 尝试重启游戏以继续后续任务');
             退出NIKKE();
             启动NIKKE();
+            等待NIKKE加载();
+            return true;
+          } catch (e3) {
+            if (isInterruptedError(e3)) {
+              interrupted = true;
+              return false;
+            }
+            console.error(`[容错恢复] 重启游戏恢复失败：${e3.message}`);
           }
-        } else
-          return false;
+        }
+        return false;
       }
     }
   };
-  let interrupted = false;
-  for (let task of todoTask) {
+
+  const runTaskWithIsolation = taskName => {
+    log(`===== 开始任务：${taskName} =====`);
+    let lastError = null;
+    for (let attempt = 0; attempt <= effectiveMaxRetry; ++attempt) {
+      try {
+        等待NIKKE加载();
+        taskFunc[taskName]();
+        log(`===== 完成任务：${taskName} =====`);
+        completedTasks.push(taskName);
+        return true;
+      } catch (error) {
+        if (isInterruptedError(error)) {
+          log(`任务"${taskName}"被手动中断`);
+          interrupted = true;
+          return false;
+        }
+        lastError = error;
+        const errMsg = (error && error.message) || String(error);
+        toast(errMsg);
+        console.error(`[任务异常][${taskName}] ${errMsg}`);
+        if (error && error.stack)
+          console.error(error.stack);
+        saveError(error, {
+          task: taskName,
+          stage: `attempt-${attempt + 1}-of-${effectiveMaxRetry + 1}`
+        });
+        if (attempt < effectiveMaxRetry) {
+          toastLog(`任务"${taskName}"出错，即将重启重试(${attempt + 1}/${effectiveMaxRetry})`);
+          sleep(3000);
+          退出NIKKE();
+          启动NIKKE();
+        }
+      }
+    }
+    const reason = (lastError && lastError.message) ? lastError.message.split('\n')[0] : '未知错误';
+    failedTasks.push({ task: taskName, reason: reason });
+    console.error(`===== 任务失败：${taskName}（原因：${reason}），继续后续任务 =====`);
+    return true;
+  };
+
+  for (let idx = 0; idx < todoTask.length; ++idx) {
+    let task = todoTask[idx];
     if (!taskFunc[task]) {
       console.error(`没有名为"${task}"的任务`);
       continue;
     }
-    if (!retryFunc(task)) {
-      interrupted = true;
+    const prevFailedCount = failedTasks.length;
+    if (!runTaskWithIsolation(task) || interrupted) {
       break;
     }
+    if (failedTasks.length > prevFailedCount && idx + 1 < todoTask.length) {
+      recoverToLobby(task);
+      if (interrupted)
+        break;
+    }
   }
+  const summary = `日常任务汇总：成功 ${completedTasks.length} 项 [${completedTasks.join('、') || '无'}]，失败 ${failedTasks.length} 项 [${failedTasks.map(x => `${x.task}(${x.reason})`).join('；') || '无'}]`;
+  log(summary);
   if (!interrupted) {
     if (NIKKEstorage.get('exitGame', false))
       退出NIKKE();
@@ -109,7 +188,9 @@ function 日常() {
   if (images.stopScreenCapturer) {
     images.stopScreenCapturer();
   }
-  toastLog('NIKKE脚本结束运行');
+  toastLog(failedTasks.length > 0
+    ? `NIKKE脚本结束运行（${failedTasks.length}项任务异常，详见日志）`
+    : 'NIKKE脚本结束运行');
 }
 
 function checkConfig() {
@@ -485,9 +566,9 @@ function 商店() {
     log('今日已刷新过普通商店');
   const buyCodeManual = NIKKEstorage.get('buyCodeManual', 3);
   const buyProfileCustomPackArena = NIKKEstorage.get('buyProfileCustomPackArena', false);
+  let arenaShop = null;
   if (buyCodeManual != 0 || buyProfileCustomPackArena) {
     const arenaShopImage = images.read("./images/arenaShop.jpg");
-    let arenaShop = null;
     for (let i = 0; i < 10; ++i) {
       arenaShop = findImageByFeature(captureScreen(), arenaShopImage, {
         threshold: 0.7,
@@ -497,13 +578,21 @@ function 商店() {
         break;
       sleep(300);
     }
-    // 减少可点击范围，避免点到悬浮窗
-    arenaShop.bounds.left += arenaShop.bounds.width() * 0.7;
-    arenaShop.text = '竞技场商店图标';
     arenaShopImage.recycle();
-    clickRect(arenaShop);
+    if (arenaShop == null) {
+      console.warn('未找到竞技场商店图标，跳过竞技场商店购买');
+      saveDiagnostic('商店_未找到竞技场图标', '10次匹配未找到竞技场商店图标', {
+        task: '商店',
+        stage: 'arenaShop'
+      });
+    } else {
+      // 减少可点击范围，避免点到悬浮窗
+      arenaShop.bounds.left += arenaShop.bounds.width() * 0.7;
+      arenaShop.text = '竞技场商店图标';
+      clickRect(arenaShop);
+    }
   }
-  if (buyCodeManual != 0) {
+  if (buyCodeManual != 0 && arenaShop != null) {
     let manuals = [];
     ocrUntilFound(res => {
       let shopName = res.find(e => e.text.match(/[竟竞]技场/) != null);
@@ -512,6 +601,8 @@ function 商店() {
         return false;
       }
       let upper = res.find(e => e.text.match(/(距离|更新|还有)/) != null);
+      if (!upper || !upper.bounds)
+        return false;
       let goods = res.toArray(3).toArray().filter(e =>
         e.text.match(/(代码手册|选择|宝箱|([A-Z]\.?){2,})/) != null &&
         e.text.match(/(s[oq0]l[od0]|[oq0]ut)/i) == null &&
@@ -529,13 +620,19 @@ function 商店() {
         return a.bounds.left - b.bounds.left;
       return t;
     });
-    if (manuals.length < 4)
-      console.warn(`竞技场商店商品识别结果不足4个：${manuals}`);
+    if (manuals.length < 4) {
+      console.warn(`竞技场商店商品识别结果不足4个：${manuals.map(x => x.text).join(' | ')}`);
+      saveDiagnostic('商店_竞技场商品识别不足', `竞技场商店商品识别不足4个(${manuals.length}个)`, {
+        task: '商店',
+        stage: 'arenaManuals',
+        extra: manuals.map(x => ({ text: x.text, bounds: String(x.bounds) }))
+      });
+    }
     for (let i = 0; i < buyCodeManual && i < manuals.length; ++i) {
       buyGood(manuals[i]);
     }
   }
-  if (buyProfileCustomPackArena) {
+  if (buyProfileCustomPackArena && arenaShop != null) {
     const item = ocrUntilFound(res => res.find(e => e.text.match(/[简介个性化]{3,}/) != null), 5, 700);
     if (item != null) {
       buyGood(item);
@@ -1499,35 +1596,110 @@ function isAdviseOutdated(advisePath) {
         accept: 'application/vnd.github+json'
       }
     });
-    return resp.body.json().length > 0;
+    if (resp.statusCode !== undefined && (resp.statusCode < 200 || resp.statusCode >= 300)) {
+      throw new Error(`HTTP ${resp.statusCode}`);
+    }
+    const commits = resp.body.json();
+    if (!Array.isArray(commits)) {
+      throw new Error('非预期的commits响应');
+    }
+    return commits.length > 0;
   } catch (error) {
     console.error(`获取更新情况失败：${error.message}`);
     return true;
   }
 }
+function countAdviseStats(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return { roles: 0, answers: 0 };
+  }
+  let roles = 0;
+  let answers = 0;
+  for (let [k, v] of Object.entries(obj)) {
+    if (k !== '$meta' && Array.isArray(v) && v.length > 0) {
+      roles++;
+      answers += v.length;
+    }
+  }
+  return { roles, answers };
+}
 function 下载咨询文本() {
   if (advise != null)
     return;
   const advisePath = files.path('./nikke.json');
-  if (isAdviseOutdated(advisePath)) {
+  let localAdvise = null;
+  if (files.exists(advisePath)) {
     try {
-      log('正在下载最新咨询文本');
-      let respStr = http.get('https://github.blindfirefly.top/https://raw.githubusercontent.com/whtsky/autoxjs-scripts/dev/NIKKE/nikke.json').body.string();
-      files.write(advisePath, respStr);
-      advise = JSON.parse(respStr);
-      log('下载完成');
-    } catch (error) {
-      log(`获取最新咨询文本失败：${error.message}`);
+      localAdvise = JSON.parse(files.read(advisePath));
+    } catch (e) {
+      console.warn(`读取本地咨询文本缓存失败：${e.message}`);
+    }
+  }
+  const localStats = countAdviseStats(localAdvise);
+  if (!localAdvise || isAdviseOutdated(advisePath)) {
+    const sources = [
+      {
+        name: 'GitHub Raw',
+        url: 'https://raw.githubusercontent.com/whtsky/autoxjs-scripts/dev/NIKKE/nikke.json'
+      },
+      {
+        name: 'GitHub API Raw',
+        url: 'https://api.github.com/repos/whtsky/autoxjs-scripts/contents/NIKKE/nikke.json?ref=dev',
+        headers: { Accept: 'application/vnd.github.raw+json' }
+      },
+      {
+        name: 'jsDelivr CDN',
+        url: 'https://cdn.jsdelivr.net/gh/whtsky/autoxjs-scripts@dev/NIKKE/nikke.json'
+      }
+    ];
+    log('正在下载最新咨询文本');
+    let downloaded = false;
+    for (let s of sources) {
+      try {
+        const resp = s.headers ? http.get(s.url, { headers: s.headers }) : http.get(s.url);
+        if (resp.statusCode !== undefined && (resp.statusCode < 200 || resp.statusCode >= 300)) {
+          throw new Error(`HTTP ${resp.statusCode}`);
+        }
+        const respStr = resp.body.string();
+        const parsed = JSON.parse(respStr);
+        const remoteStats = countAdviseStats(parsed);
+        if (remoteStats.roles < 100) {
+          throw new Error('咨询JSON结构异常或条目过少');
+        }
+        if (
+          localAdvise &&
+          (remoteStats.roles < localStats.roles ||
+            (remoteStats.roles === localStats.roles && remoteStats.answers < localStats.answers))
+        ) {
+          log(
+            `远程咨询文本（${s.name}：${remoteStats.roles}角色/${remoteStats.answers}条）旧于本地缓存（${localStats.roles}角色/${localStats.answers}条），保留本地版本`
+          );
+          advise = localAdvise;
+          downloaded = true;
+          break;
+        }
+        files.write(advisePath, respStr);
+        advise = parsed;
+        log(`咨询文本下载完成（来源：${s.name}，${remoteStats.roles}角色/${remoteStats.answers}条）`);
+        downloaded = true;
+        break;
+      } catch (error) {
+        console.warn(`从${s.name}获取咨询文本失败：${error.message}`);
+      }
+    }
+    if (!downloaded) {
+      console.error('所有远程源均无法获取最新咨询文本，将使用本地缓存');
+      advise = localAdvise;
     }
   } else {
-    log('当前咨询文本已是最新');
+    log(`当前咨询文本已是最新（${localStats.roles}角色/${localStats.answers}条）`);
+    advise = localAdvise;
   }
   if (advise == null)
-    advise = JSON.parse(files.read(advisePath));
-  if (advise != null)
-    advise = Object.fromEntries(
-      Object.entries(advise).filter(([_, v]) => v.length > 0)
-    );
+    throw new Error('咨询文本加载失败：本地与远程均不可用');
+  advise = Object.fromEntries(
+    Object.entries(advise).filter(([k, v]) => k != '$meta' && Array.isArray(v) && v.length > 0)
+  );
 }
 
 function 咨询() {
@@ -1581,10 +1753,22 @@ function 咨询() {
     return null;
   }, 20, 1000) != true)
     throw new Error('无法进入单人咨询页面');
-  while (cnt < adviseCnt) {
+  let consecutiveRetry = 0;
+  let totalAttempts = 0;
+  const maxTotalAttempts = Math.max(30, adviseCnt * 4);
+  while (cnt < adviseCnt && totalAttempts < maxTotalAttempts) {
+    totalAttempts++;
     let res = 单次咨询();
     if (res == 'ok') {
       cnt++;
+      consecutiveRetry = 0;
+    } else if (res == 'retry') {
+      consecutiveRetry++;
+      if (consecutiveRetry >= 3) {
+        throw new Error('连续3次咨询页面解析失败');
+      }
+    } else {
+      consecutiveRetry = 0;
     }
     if (res != 'retry' && cnt < adviseCnt) {
       swipeRandom(new android.graphics.Rect(
@@ -1594,14 +1778,20 @@ function 咨询() {
       sleep(600);
     }
   }
+  if (cnt < adviseCnt) {
+    console.warn(`咨询尝试达到上限(${totalAttempts}/${maxTotalAttempts})，已完成${cnt}/${adviseCnt}`);
+  }
   toastLog('完成咨询');
   返回首页();
 }
 
 function matchAdviseNikkeName(target) {
-  const normalize = name => name.toLowerCase().replace(/[\s:：]/g, '');
+  const normalize = name => name.toLowerCase().replace(/[\s:：\.·]/g, '');
   const names = Object.keys(advise);
   const normalizedTarget = normalize(target);
+  if (!normalizedTarget || /^[^a-z\u4e00-\u9fa5]+$/.test(normalizedTarget)) {
+    return { result: null, nearest: null, similarity: 0, reason: '非有效名称文本' };
+  }
   const exact = names.filter(name => normalize(name) == normalizedTarget);
   if (exact.length == 1)
   return { result: exact[0], similarity: 1 };
@@ -1660,7 +1850,23 @@ function 咨询页面识别(btnText, maxRetry) {
   下载咨询文本();
   btnText = btnText || '^[^快連德逮速遠]*咨询$';
   maxRetry = maxRetry || 5;
-  const [btn, 查看花絮, 下一花絮, RANK, fullLog] = ocrUntilFound((res, img) => {
+  const pageInfo = ocrUntilFound((res, img, scale) => {
+    const rankIncrease = res.find(e =>
+      /INCREASE|解锁花絮|点击进行下一步/i.test(e.text) && e.bounds != null
+    );
+    if (rankIncrease != null) {
+      const nextStep = res.find(e => /下一步|点击/.test(e.text) && e.bounds != null) || rankIncrease;
+      const targetRect = new android.graphics.Rect(
+        Math.round(nextStep.bounds.left / scale),
+        Math.round(nextStep.bounds.top / scale),
+        Math.round(nextStep.bounds.right / scale),
+        Math.round(nextStep.bounds.bottom / scale)
+      );
+      log('检测到好感度升级弹窗，点击关闭');
+      clickRect({ text: '关闭好感度升级弹窗', bounds: targetRect }, 0.6, 0);
+      sleep(800);
+      return null;
+    }
     const btn = res.find(e =>
       e.text.match(btnText) != null && e.level == 3 &&
       e.bounds != null && e.bounds.top > img.height / 2
@@ -1680,6 +1886,14 @@ function 咨询页面识别(btnText, maxRetry) {
     ) != null;
     return [btn, 咨询日志, 下一花絮, RANK, fullLog];
   }, 20, 1000, { maxScale: 4, gray: true });
+  if (!pageInfo) {
+    saveDiagnostic('咨询_页面解析失败', `未能识别咨询页面关键按钮(btnText=${btnText})`, {
+      task: '咨询',
+      stage: '咨询页面识别'
+    });
+    return [null, '', false];
+  }
+  const [btn, 查看花絮, 下一花絮, RANK, fullLog] = pageInfo;
   const nameRect = new android.graphics.Rect(
     0, captureScreen().height / 2,
     查看花絮.bounds.left,
@@ -1692,6 +1906,7 @@ function 咨询页面识别(btnText, maxRetry) {
   let name = '';
   let bestUnmatched = null;
   let hasMax = false;
+  let ocrByScale = [];
   let img = images.clip(
     captureScreen(), nameRect.left, nameRect.top,
     nameRect.width(), nameRect.height()
@@ -1705,6 +1920,7 @@ function 咨询页面识别(btnText, maxRetry) {
     if (scale > 1)
       newImg = images.scale(img, scale, scale, 'CUBIC');
     let res = gmlkit.ocr(newImg, 'zh').toArray(3).toArray().map(x => x.text);
+    ocrByScale.push(`scale=${scale}: ${res.join(' | ')}`);
     if (scale > 1)
       newImg && newImg.recycle();
     let i = 0;
@@ -1714,9 +1930,13 @@ function 咨询页面识别(btnText, maxRetry) {
         continue;
       if (childText.match(/[Mm].[Xx]/) != null) {
         hasMax = true;
-        continue;
       }
-      if (childText.match(/[:：]$/) != null && i + 1 < res.length) {
+      childText = childText.replace(/^[♥♡❤\s]*R\s*A\s*N\s*K\s*(\d+|[Mm].[Xx])?\s*/i, '').trim();
+      if (childText.length == 0 || /^[^a-zA-Z\u4e00-\u9fa5]+$/.test(childText))
+        continue;
+      if (childText.match(/[:：]$/) != null && i < res.length) {
+        childText += res[i++];
+      } else if (i < res.length && /^[:：]/.test(res[i])) {
         childText += res[i++];
       }
       if (childText.match(/^雷[费骨賽費登]$/) != null)
@@ -1745,7 +1965,20 @@ function 咨询页面识别(btnText, maxRetry) {
       const nearest = bestUnmatched && bestUnmatched.nearest;
       const similarity = bestUnmatched ? bestUnmatched.similarity.toFixed(2) : '0.00';
       const reason = bestUnmatched ? bestUnmatched.reason : 'OCR未检测到名称';
-      log(`妮姬名称未匹配咨询JSON：OCR="${res.join(' ')}"，最近候选="${nearest || '无'}"，相似度${similarity}，原因：${reason}`);
+      const msg = `妮姬名称未匹配咨询JSON：OCR="${res.join(' ')}"，最近候选="${nearest || '无'}"，相似度${similarity}，原因：${reason}`;
+      log(msg);
+      saveDiagnostic('咨询_名称未识别', msg, {
+        task: '咨询',
+        stage: '咨询页面识别',
+        cropImg: img,
+        extra: {
+          nameRect: String(nameRect),
+          nearest: nearest || null,
+          similarity: similarity,
+          reason: reason,
+          ocrByScale: ocrByScale
+        }
+      });
       toast(bestUnmatched && bestUnmatched.reason == '该妮姬形态没有对应的咨询数据'
         ? '该妮姬形态暂无咨询答案'
         : '未找到可靠的妮姬名称匹配');
@@ -1844,6 +2077,15 @@ function 单次咨询() {
         clickRect(getRandomArea(img, [0, 0.1, 1, 0.4]), 0.6, 0);
       sleep(random(300, 1500));
     }
+    if (!result || result.length < 2) {
+      console.warn(`未识别到全部2个二选一选项框(识别数=${result ? result.length : 0})`);
+      saveDiagnostic('咨询_未识别选项框', `咨询对象=${name}，未识别到2个选项框(识别数=${result ? result.length : 0})`, {
+        task: '咨询',
+        stage: '单次咨询'
+      });
+      返回咨询首页();
+      return 'failed';
+    }
     let options = ocrUntilFound(res => {
       let ret = [];
       for (let optionRect of result) {
@@ -1860,18 +2102,35 @@ function 单次咨询() {
         return null;
       return ret;
     }, 10, 300) || ["", ""];
-    let whichOne = null, similarOne = -1;
+    let whichOne = 0, similarOne = -1, bestMatchText = '';
     for (let k = 0; k < 2; ++k) {
-      options[k] = options[k].replace(/["❤♥,，:：\.。…\?\!？！、「」～~☆【】《》♪\s-\—]/g, '');
+      options[k] = (options[k] || '').replace(/["❤♥,，:：\.。…\?\!？！、「」～~☆【】《》♪\s-\—]/g, '');
       let t = mostSimilar(options[k], advise[name]);
       log(`选项${k + 1}："${options[k]}"`);
       log(`匹配："${t.result}"，相似度${t.similarity.toFixed(2)}`);
       if (t.similarity > similarOne) {
         similarOne = t.similarity;
         whichOne = k;
+        bestMatchText = t.result || '';
       }
     }
     let thresh = options[whichOne].length < 3 ? 1 : 0.75;
+    if (similarOne < thresh && i == 1) {
+      saveDiagnostic(
+        '咨询_选项相似度低',
+        `咨询对象=${name}，选项1="${options[0]}"，选项2="${options[1]}"，最高匹配="${bestMatchText}"(${similarOne.toFixed(2)})`,
+        {
+          task: '咨询',
+          stage: '单次咨询',
+          extra: {
+            nikke: name,
+            options: options,
+            bestMatch: bestMatchText,
+            similarity: Number(similarOne.toFixed(3))
+          }
+        }
+      );
+    }
     if (similarOne < thresh && i < maxRetry) {
       toastLog(`相似度过低，放弃本次咨询(尝试次数${i}/${maxRetry})`);
       ocrUntilFound(res => {
@@ -1906,7 +2165,13 @@ function 单次咨询() {
     log(`咨询选择："${options[whichOne]}"`);
     clickRect({ bounds: result[whichOne] }, 0.8, 0);
     ocrUntilFound((res, img) => {
-      if (res.find(e => e.text.endsWith('咨询')))
+      if (/INCREASE|解锁花絮|点击进行下一步/i.test(res.text)) {
+        const nextStep = res.find(e => /下一步|点击/.test(e.text) && e.bounds != null);
+        clickRect(nextStep || getRandomArea(img, [0.2, 0.65, 0.8, 0.82]), 0.6, 0);
+        sleep(600);
+        return false;
+      }
+      if (res.find(e => e.text.includes('日志')) && res.find(e => e.text.endsWith('咨询')))
         return true;
       let skipBtn = res.find(e =>
         e.text.match(/[LAUTOG]/) == null && e.text.match(/SK.P/) != null
@@ -1920,7 +2185,15 @@ function 单次咨询() {
     }, 30, 1000);
     break;
   }
-  ocrUntilFound(res => res.text.includes('咨询'), 20, 3000);
+  ocrUntilFound((res, img) => {
+    if (/INCREASE|解锁花絮|点击进行下一步/i.test(res.text)) {
+      const nextStep = res.find(e => /下一步|点击/.test(e.text) && e.bounds != null);
+      clickRect(nextStep || getRandomArea(img, [0.2, 0.65, 0.8, 0.82]), 0.6, 0);
+      sleep(600);
+      return false;
+    }
+    return res.text.includes('咨询') && res.text.includes('日志');
+  }, 20, 1500);
   return 'ok';
 }
 
@@ -1975,7 +2248,21 @@ function 解放() {
   let tasks = {};
   let taskChecked = false;
   let confirmCount = 0;
+  let hookAttempts = 0;
   let taskHook = (res, img) => {
+    if (taskChecked)
+      return true;
+    hookAttempts++;
+    if (hookAttempts > 12) {
+      console.warn('解放任务识别重试超过12次，跳过解放任务检测并返回大厅');
+      saveDiagnostic('解放_任务识别超限', '解放任务区域12次OCR未稳定为3项，跳过解析并返回大厅', {
+        task: '每日任务',
+        stage: '解放'
+      });
+      tasks = {};
+      taskChecked = true;
+      return true;
+    }
     let skipBtn = res.find(e =>
       e.text.match(/SK.P/) != null && e.bounds != null &&
       e.bounds.left >= img.width * 0.5 &&
@@ -1995,7 +2282,8 @@ function 解放() {
       sleep(1000);
       return false;
     }
-    let timeBound = res.find(e => e.text.match(/更新.*小时.{0,4}分钟/) != null);
+    let timeBound = res.find(e => e.text.match(/更新.*小时.{0,4}分钟/) != null) ||
+      res.find(e => e.bounds != null && e.text.includes('更新时间'));
     if (timeBound == null && findBackBtn(res, img) && !res.text.includes('AUT')) {
       let chineseStrs = res.toArray(3).toArray().filter(e =>
         e.text.match(/[\u4e00-\u9fa5]+/) != null
@@ -2018,11 +2306,18 @@ function 解放() {
       sleep(1000);
       return false;
     }
+    let coreBound = res.find(e =>
+      e.bounds != null && e.bounds.top > timeBound.bounds.bottom &&
+      /核心动|CHECK\s*COR/i.test(e.text)
+    );
+    let lowerLimit = coreBound
+      ? coreBound.bounds.top
+      : timeBound.bounds.bottom + Math.max(450, Math.round(img.height * 0.2));
     let taskBtns = res.toArray(3).toArray().filter(e =>
       e.bounds != null &&
-      e.bounds.left >= timeBound.bounds.left &&
+      e.bounds.right > timeBound.bounds.left &&
       e.bounds.top > timeBound.bounds.bottom &&
-      e.bounds.bottom < timeBound.bounds.bottom + 400
+      e.bounds.bottom < lowerLimit
     );
     let completeBtns = taskBtns.filter(e => e.text.match(/[成戍戌]$/) != null);
     let otherBtns = taskBtns.filter(e => e.text.match(/(^直|[往住]$|CLE)/) != null);

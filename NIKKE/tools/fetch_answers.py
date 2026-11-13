@@ -103,7 +103,24 @@ def get_from_gamekee_netcut():
     return parse_gamekee_data(note_content)
 
 
-def get_gamekee_content(content_detail, game_header):
+GAMEKEE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/131.0.0.0 Safari/537.36'
+    ),
+    'Referer': 'https://www.gamekee.com/',
+    'Origin': 'https://www.gamekee.com',
+    'game-alias': 'nikke',
+}
+
+
+def normalize_nikke_name(name: str) -> str:
+    return re.sub(r'\s*:\s*', '：', name.strip())
+
+
+def get_gamekee_content(content_detail, game_header=None):
+    headers = {**GAMEKEE_HEADERS, **(game_header or {})}
     content = content_detail.get('content_json')
     if content:
         content_json = json.loads(content)
@@ -112,9 +129,15 @@ def get_gamekee_content(content_detail, game_header):
         if not content_cdn:
             raise ValueError('Gamekee content has neither inline JSON nor a CDN URL')
         content_url = urljoin('https://www.gamekee.com', content_cdn)
-        response = session.get(content_url, headers=game_header, timeout=30)
+        response = session.get(content_url, headers=headers, timeout=30)
         response.raise_for_status()
         content_json = response.json()
+        if (
+            isinstance(content_json, dict) and
+            'baseData' not in content_json and
+            isinstance(content_json.get('content'), str)
+        ):
+            content_json = json.loads(content_json['content'])
 
     if not isinstance(content_json, dict) or not isinstance(content_json.get('baseData'), list):
         raise ValueError('Gamekee content JSON does not contain baseData')
@@ -123,9 +146,9 @@ def get_gamekee_content(content_detail, game_header):
 
 def get_from_gamekee_wiki(skip_names: set[str]):
     # gamekee误写
-    skip_names.update(['D:杀手妻子'])
+    skip_names = {normalize_nikke_name(n) for n in skip_names}
     ret = dict()
-    game_header = {'game-alias': 'nikke'}
+    game_header = dict(GAMEKEE_HEADERS)
     entry_url = 'https://www.gamekee.com/v1/wiki/entry'
     entry_response = session.get(entry_url, headers=game_header, timeout=30)
     entry_response.raise_for_status()
@@ -194,7 +217,7 @@ def get_from_gamekee_wiki(skip_names: set[str]):
     parsed_entries = 0
     skipped_entries = 0
     for nikke in characters:
-        nikke_name = nikke.get('name', '<unknown>')
+        nikke_name = normalize_nikke_name(nikke.get('name', '<unknown>'))
         if nikke_name in skip_names:
             continue
         # 编辑中词条
@@ -203,7 +226,6 @@ def get_from_gamekee_wiki(skip_names: set[str]):
             continue
         try:
             if not is_valid(nikke):
-                ret[nikke_name] = []
                 continue
             detail_response = session.get(
                 f"https://www.gamekee.com/v1/content/detail/{content_id}",
@@ -228,9 +250,12 @@ def get_from_gamekee_wiki(skip_names: set[str]):
             name = name_entry[1].get('value') if (
                 name_entry and len(name_entry) > 1 and isinstance(name_entry[1], dict)
             ) else nikke_name
-            if not isinstance(name, str) or not name:
+            if not isinstance(name, str) or not name.strip():
                 name = nikke_name
-            ret[name] = set(get_single(base_data))
+            name = normalize_nikke_name(name)
+            answers = set(get_single(base_data))
+            if answers:
+                ret.setdefault(name, set()).update(answers)
             parsed_entries += 1
         except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as error:
             skipped_entries += 1
@@ -324,7 +349,8 @@ def main(nikke_json_path=None):
                     if name != '$meta'}
     for source in fresh_sources:
         for name, answers in source.items():
-            updated_data.setdefault(name, set()).update(answers)
+            if answers:
+                updated_data.setdefault(name, set()).update(answers)
     change_texts = []
     for name in sorted(updated_data):
         count = len(updated_data[name]) - len(set(old_data.get(name, [])))

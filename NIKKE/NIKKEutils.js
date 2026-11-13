@@ -7,6 +7,8 @@ var {
 } = require('./utils.js');
 var firstCheckAuto = true;
 var homeBtn = null;
+var softDiagnosticCount = 0;
+var MAX_SOFT_DIAGNOSTICS_PER_RUN = 12;
 if (typeof module === 'undefined') {
   auto.waitFor();
   unlockIfNeed();
@@ -23,6 +25,7 @@ if (typeof module === 'undefined') {
 else {
   module.exports = {
     saveError: saveError,
+    saveDiagnostic: saveDiagnostic,
     启动NIKKE: 启动NIKKE,
     等待NIKKE加载: 等待NIKKE加载,
     退出NIKKE: 退出NIKKE,
@@ -35,47 +38,125 @@ else {
     checkAuto: checkAuto,
   };
 }
-function saveError(error) {
-  const errorPath = files.path(`./nikkerror/${Date.now()}/`);
-  const errorStrs = [
-    `当前脚本版本：${NIKKEstorage.get('tagName', '无记录')}`,
-    error.message,
-    error.stack
-  ];
-  files.ensureDir(errorPath);
-  if (ocrInfo.img) {
-    images.save(ocrInfo.img, files.join(errorPath, 'error.png'));
-  }
-  if (ocrInfo.result) {
-    errorStrs.push('');
-    const res = ocrInfo.result.toArray(3);
-    for (let i = 0; i < res.length; ++i) {
-      errorStrs.push(`${res[i].bounds}\t"${res[i].text}"`);
-    }
-  }
-  files.write(files.join(errorPath, 'log.txt'), errorStrs.join('\n'));
-  console.error(`出错日志已保存到${errorPath}`);
-  console.error('上报问题时请务必附上上述出错日志目录中的内容');
-}
-function 启动NIKKE() {
-  let NIKKEstorage = storages.create("NIKKEconfig");
+function pruneErrorDirs(maxErr) {
+  maxErr = maxErr || 30;
   let errorPath = files.path('./nikkerror/');
   files.ensureDir(errorPath);
-  // 保证错误截图不要过多
-  let maxErr = 10;
   let errorDirs = files.listDir(errorPath);
   if (errorDirs.length >= maxErr) {
-    errorDirs.sort((a, b) => parseInt(b.split('.')[0]) - parseInt(a.split('.')[0]));
+    errorDirs.sort((a, b) => (parseInt(b.split(/[_\.]/)[0]) || 0) - (parseInt(a.split(/[_\.]/)[0]) || 0));
     for (let f of errorDirs.slice(maxErr)) {
       log(`删除过期错误日志：${f}`);
       let fp = files.join(errorPath, f);
       if (files.isFile(fp)) {
         files.remove(fp);
       } else if (files.isDir(fp)) {
-        files.removeDir(files.join(errorPath, f));
+        files.removeDir(fp);
       }
     }
   }
+}
+function saveError(error, options) {
+  options = options || {};
+  if (options.soft) {
+    if (softDiagnosticCount >= MAX_SOFT_DIAGNOSTICS_PER_RUN) {
+      console.warn(`单次运行诊断快照已达上限(${MAX_SOFT_DIAGNOSTICS_PER_RUN})，跳过保存：${options.tag || ''}`);
+      return null;
+    }
+    softDiagnosticCount++;
+  }
+  const NIKKEstorage = storages.create("NIKKEconfig");
+  const errObj = error instanceof Error ? error : new Error(String(error));
+  const rawTag = [options.task, options.tag].filter(x => x).join('_');
+  const safeTag = rawTag ? rawTag.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40) : '';
+  pruneErrorDirs(30);
+  const errorPath = files.path(`./nikkerror/${Date.now()}${safeTag ? '_' + safeTag : ''}/`);
+  const errorStrs = [
+    `时间：${new Date().toISOString()}`,
+    `当前脚本版本：${NIKKEstorage.get('tagName', '无记录')}`,
+  ];
+  if (options.task || options.tag || options.stage) {
+    errorStrs.push(`任务/阶段：${[options.task, options.tag, options.stage].filter(x => x).join(' / ')}`);
+  }
+  errorStrs.push(`OCR缩放倍数：${ocrInfo.scale || 1}`);
+  errorStrs.push(errObj.message || '未知错误');
+  if (errObj.stack) {
+    errorStrs.push(errObj.stack);
+  }
+  if (options.extra) {
+    errorStrs.push('');
+    errorStrs.push('=== 诊断上下文 ===');
+    errorStrs.push(typeof options.extra === 'string' ? options.extra : JSON.stringify(options.extra, null, 2));
+  }
+  files.ensureDir(errorPath);
+  let savedMainImg = false;
+  let freshOcrResult = null;
+  if (options.captureFresh !== false) {
+    try {
+      const freshImg = captureScreen();
+      if (freshImg) {
+        images.save(freshImg, files.join(errorPath, 'error.png'));
+        savedMainImg = true;
+        if (!ocrInfo.result) {
+          try {
+            freshOcrResult = gmlkit.ocr(freshImg, 'zh');
+          } catch (ocrErr) {}
+        }
+      }
+    } catch (capErr) {}
+  }
+  if (!savedMainImg && ocrInfo.img) {
+    const scale = ocrInfo.scale || 1;
+    if (scale > 1) {
+      let scaledBack = null;
+      try {
+        scaledBack = images.scale(ocrInfo.img, 1 / scale, 1 / scale);
+        images.save(scaledBack, files.join(errorPath, 'error.png'));
+        savedMainImg = true;
+      } finally {
+        scaledBack && scaledBack.recycle();
+      }
+    } else {
+      images.save(ocrInfo.img, files.join(errorPath, 'error.png'));
+      savedMainImg = true;
+    }
+  }
+  if (options.cropImg) {
+    try {
+      images.save(options.cropImg, files.join(errorPath, 'crop.png'));
+    } catch (cropErr) {}
+  }
+  const ocrResultToSave = ocrInfo.result || freshOcrResult;
+  if (ocrResultToSave) {
+    errorStrs.push('');
+    errorStrs.push(`=== OCR识别结果 (scale=${ocrInfo.result ? (ocrInfo.scale || 1) : 1}) ===`);
+    const res = ocrResultToSave.toArray(3);
+    for (let i = 0; i < res.length; ++i) {
+      errorStrs.push(`${res[i].bounds}\t"${res[i].text}"`);
+    }
+  }
+  if (ocrInfo.logs && ocrInfo.logs.length > 0) {
+    errorStrs.push('');
+    errorStrs.push(`=== 最近运行日志 (${ocrInfo.logs.length}条) ===`);
+    for (let i = 0; i < ocrInfo.logs.length; ++i) {
+      errorStrs.push(ocrInfo.logs[i]);
+    }
+  }
+  files.write(files.join(errorPath, 'log.txt'), errorStrs.join('\n'));
+  console.error(`出错日志已保存到${errorPath}`);
+  if (!options.soft) {
+    console.error('上报问题时请务必附上上述出错日志目录中的内容');
+  }
+  return errorPath;
+}
+function saveDiagnostic(tag, message, options) {
+  const opts = Object.assign({ soft: true, tag: tag }, options || {});
+  return saveError(new Error(`[${tag}] ${message}`), opts);
+}
+function 启动NIKKE() {
+  let NIKKEstorage = storages.create("NIKKEconfig");
+  softDiagnosticCount = 0;
+  pruneErrorDirs(30);
   if (NIKKEstorage.get('mute', false)) {
     try {
       device.setMusicVolume(0);
@@ -132,8 +213,7 @@ function 启动NIKKE() {
       sleep(3000);
     }
     if (i == maxRetry) {
-      console.error('启动v2rayNG服务失败');
-      exit();
+      throw new Error('启动v2rayNG服务失败');
     }
     id('fab').click();
   }
@@ -403,11 +483,9 @@ function 等待NIKKE加载() {
   const continueBtn = getRandomArea(captureScreen(), [0.2, 0.2, 0.8, 0.8]);
   continueBtn.text = 'TOUCH TO CONTINUE';
   if (ocrUntilFound(res => {
-    if (res.text.match(/(密|验证)码/) != null) {
+    if (res.text.match(/((邮箱|密码|账号).*(登录|登入)|忘记密码|输入验证码)/) != null) {
       if (!tryLogin()) {
-        toastLog('未登录游戏，停止运行脚本');
-        home();
-        exit();
+        throw new Error('未登录游戏，停止运行脚本');
       }
     }
     else if (res.text.includes('不再显')) {
@@ -564,6 +642,9 @@ function 返回首页(checkSale, beforeHook) {
     if (t != null)
       return t;
     let clickHome = false;
+    if (i == 5) {
+      homeBtn = null;
+    }
     if (homeBtn === null) {
       homeBtn = findImageByFeature(img, homeImage, {
         threshold: 0.6,
@@ -574,28 +655,37 @@ function 返回首页(checkSale, beforeHook) {
         homeBtn.bounds.top < 0 ||
         homeBtn.bounds.bottom > img.height
       ) {
+        homeBtn = null;
         back();
         sleep(500);
+        i++;
         return null;
       }
       homeBtn.text = '首页图标';
       clickHome = true;
-    } else if (i % 5 == 0) {
+    } else if (i % 3 == 0) {
       clickHome = true;
     } else {
       let oc = homeImage.pixel(0, 0);
       let cc = img.pixel(homeBtn.bounds.left, homeBtn.bounds.top);
       if (colors.isSimilar(oc, cc, 75))
         clickHome = true;
+      else
+        back();
     }
     if (clickHome)
-      clickRect(homeBtn, 0.8, 0);
+      clickRect(homeBtn, 0.6, 0);
     sleep(Math.max(500, 2000 - 500 * i));
     i++;
     return null;
   }, 25, 1000);
   homeImage && homeImage.recycle();
-  // hallBtn should not be null
+  if (hallBtn == null) {
+    const ocrText = ocrInfo.result && ocrInfo.result.text;
+    throw new Error(
+      `返回首页失败：25次OCR后未识别到大厅按钮；当前OCR=${ocrText || '无'}`
+    );
+  }
   if (checkSale)
     关闭限时礼包();
   clickRect(hallBtn, 1, 200);

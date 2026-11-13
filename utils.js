@@ -1,14 +1,84 @@
 const 手机锁屏密码 = '';
 var ocrInfo = {
   result: null,
-  img: null
+  img: null,
+  scale: 1,
+  logs: []
 };
+function recordLog(level, args) {
+  const pad = (n, w) => ('000' + n).slice(-(w || 2));
+  const d = new Date();
+  const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+  const parts = [];
+  for (let i = 0; i < args.length; ++i) {
+    const x = args[i];
+    if (x instanceof Error) {
+      parts.push(x.stack || x.message);
+    } else if (typeof x === 'object' && x !== null) {
+      try {
+        const s = String(x);
+        parts.push(s === '[object Object]' ? JSON.stringify(x) : s);
+      } catch (e) {
+        parts.push(String(x));
+      }
+    } else {
+      parts.push(String(x));
+    }
+  }
+  ocrInfo.logs.push(`${ts}/${level}: ${parts.join(' ')}`);
+  if (ocrInfo.logs.length > 200) {
+    ocrInfo.logs.shift();
+  }
+}
+(function installLogRecorder() {
+  if (ocrInfo._logHooked)
+    return;
+  ocrInfo._logHooked = true;
+  const root = typeof global !== 'undefined' ? global : null;
+  const targetConsole = (root && root.console) || (typeof console !== 'undefined' ? console : null);
+  if (targetConsole && !targetConsole._nikkeHooked) {
+    try {
+      targetConsole._nikkeHooked = true;
+    } catch (e) {}
+    const levels = [['log', 'D'], ['info', 'I'], ['warn', 'W'], ['error', 'E']];
+    for (let i = 0; i < levels.length; ++i) {
+      const [fnName, tag] = levels[i];
+      try {
+        const orig = targetConsole[fnName];
+        if (typeof orig === 'function') {
+          targetConsole[fnName] = function () {
+            recordLog(tag, arguments);
+            return orig.apply(targetConsole, arguments);
+          };
+        }
+      } catch (e) {}
+    }
+  }
+  if (root) {
+    if (typeof root.log === 'function') {
+      const origLog = root.log;
+      root.log = function () {
+        recordLog('D', arguments);
+        return origLog.apply(this, arguments);
+      };
+      ocrInfo._globalLogHooked = true;
+    }
+    if (typeof root.toastLog === 'function') {
+      const origToastLog = root.toastLog;
+      root.toastLog = function () {
+        recordLog('T', arguments);
+        return origToastLog.apply(this, arguments);
+      };
+    }
+  }
+})();
 if (typeof module === 'undefined') {
   getOcrRes();
 }
 else {
   module.exports = {
     ocrInfo: ocrInfo,
+    recordLog: recordLog,
     scaleBack: scaleBack,
     screenshot: screenshot,
     ocrUntilFound: ocrUntilFound,
@@ -86,7 +156,7 @@ function scaleBack(x, scale) {
  * 
  * @param {boolean} [ocr] 
  */
-function screenshot(img, ocr) {
+function screenshot(img, ocr, scale) {
   if (img === undefined) {
     img = images.copy(captureScreen());
   }
@@ -96,6 +166,7 @@ function screenshot(img, ocr) {
   // 回收上一张图
   ocrInfo.img && ocrInfo.img.recycle();
   ocrInfo.img = img;
+  ocrInfo.scale = scale || 1;
   if (ocr) {
     ocrInfo.result = gmlkit.ocr(ocrInfo.img, "zh");
   } else {
@@ -114,8 +185,8 @@ function screenshot(img, ocr) {
  */
 function ocrUntilFound(found, retry, interval, options) {
   options = options || {};
-  maxScale = options.maxScale || 1;
-  gray = (options.gray === true);
+  let maxScale = options.maxScale || 1;
+  let gray = (options.gray === true);
   for (let i = 0; i < retry; ++i) {
     sleep(interval);
     let scale = (i % maxScale) + 1;
@@ -131,7 +202,7 @@ function ocrUntilFound(found, retry, interval, options) {
       img && img.recycle();
       img = newImg;
     }
-    screenshot(img, true);
+    screenshot(img, true, scale);
     if (ocrInfo.result == null || ocrInfo.result.text == null)
       continue;
     let res = found(ocrInfo.result, img, scale);
@@ -146,11 +217,18 @@ function ocrUntilFound(found, retry, interval, options) {
       return res;
     }
   }
-  console.trace("OCR失败");
+  const recentOcr = ocrInfo.result && ocrInfo.result.text
+    ? ocrInfo.result.text.replace(/\s+/g, ' ').slice(0, 120)
+    : '无';
+  recordLog('W', [`OCR失败(重试${retry}次)，最近OCR="${recentOcr}"`]);
+  console.trace(`OCR失败(重试${retry}次)，最近OCR="${recentOcr}"`);
   return null;
 }
 
 function clickRect(rect, scale, delay) {
+  if (!rect || !rect.bounds) {
+    throw new Error(`clickRect目标为空：${rect ? JSON.stringify(rect) : 'null'}`);
+  }
   // delay可能是0
   if (delay === undefined)
     delay = 1000;
@@ -164,6 +242,8 @@ function clickRect(rect, scale, delay) {
   let x = Math.round((random() - 0.5) * rect.bounds.width() * scale + rect.bounds.centerX());
   let y = Math.round((random() - 0.5) * rect.bounds.height() * scale + rect.bounds.centerY());
   logText += `(${x}, ${y})`;
+  if (!ocrInfo._globalLogHooked)
+    recordLog('D', [`点击${logText}`]);
   log(`点击${logText}`);
   click(x, y);
 }
@@ -340,7 +420,7 @@ function findImageByFeature(trainImg, queryImg, options) {
       toast(logText);
       console.error(logText);
       console.show();
-      exit();
+      throw new Error(logText);
     }
     throw e;
   }
